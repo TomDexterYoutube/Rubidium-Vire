@@ -2337,21 +2337,26 @@ static void* _ffi_try_versioned(const char* name) {
 
 long long ffi_load(const char* path) {
     void* h = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
-    if(!h && !strchr(path, '/')) {
+    // BUG (found running a real xeon-built project from its PROJECT ROOT,
+    // not build/): the exe-dir-relative retry below used to only fire for
+    // a BARE name (no '/' at all) — a NESTED relative path like
+    // FFI("lib/libraylib.so") (exactly what the smart FFI bundler
+    // preserves under build/) was left "exactly as given" on the theory
+    // that an explicit path meant the caller already knew where the
+    // library was — but the caller only knows where it is RELATIVE TO THE
+    // COMPILED OUTPUT, not relative to whatever directory the process
+    // happens to be launched from (build/ when run directly, the project
+    // ROOT when launched via `xeon run`/most other conventions). ANY
+    // relative path (doesn't start with '/') gets this retry now, not
+    // just a bare name — an absolute path is left alone (already fully
+    // specified, no ambiguity to resolve).
+    if(!h && path[0] != '/') {
         char exe_dir[4096];
         _exe_dir(exe_dir, sizeof(exe_dir));
         if(exe_dir[0]) {
             char candidate[4096];
-            snprintf(candidate, sizeof(candidate), "%s/lib/%s", exe_dir, path);
+            snprintf(candidate, sizeof(candidate), "%s/%s", exe_dir, path);
             h = dlopen(candidate, RTLD_LAZY | RTLD_LOCAL);
-            // BUG-25: also look right NEXT TO the binary. The bundler copies
-            // src/**.so into the build dir preserving its path under src/, so
-            // a lib at src/foo.so lands at build/foo.so — which the lib/
-            // candidate above would never find.
-            if(!h) {
-                snprintf(candidate, sizeof(candidate), "%s/%s", exe_dir, path);
-                h = dlopen(candidate, RTLD_LAZY | RTLD_LOCAL);
-            }
         }
     }
     // BUG-25: last resort for a bare name — find the installed versioned soname.
@@ -3179,10 +3184,31 @@ def compile_files(source_files, output=None, shared_lib=False, native=None):
             f_c.write(RUNTIME_C)
             c_path = f_c.name
 
+        # syntax: FFI > STATIC LINKING — `let raylib = FFI("lib.a")`.
+        # gen.static_ffi_archives is every archive path any such handle in
+        # this file referenced (see codegen.py's own comment on that set);
+        # passing them straight to clang links their code directly into
+        # THIS output, no separate .so needed for them at runtime at all —
+        # the whole point: one self-contained .so, not a .so that dlopens
+        # another .so.
+        #
+        # Unlike a dynamic FFI("...") path (resolved at RUNTIME, relative
+        # to wherever the compiled program ends up running from), a static
+        # archive has to be found NOW, at build time — resolve it relative
+        # to the SOURCE file's own directory first (the same "lives next
+        # to the source that references it" convention xeon's FFI bundler
+        # already uses for dynamic libs), falling back to as-given (CWD-
+        # relative, or already absolute) if not found there.
+        source_dir = os.path.dirname(os.path.abspath(source_files[0]))
+        static_archives = []
+        for rel in sorted(gen.static_ffi_archives):
+            candidate = os.path.join(source_dir, rel)
+            static_archives.append(candidate if os.path.exists(candidate) else rel)
+
         def _clang_cmd(flags):
             base = ["clang", "-shared", "-fPIC", ir_path, c_path, "-o", output_bin] if shared_lib \
                 else ["clang", ir_path, c_path, "-o", output_bin]
-            return base + flags + ["-pthread", "-ldl", "-lm"]
+            return base + static_archives + flags + ["-pthread", "-ldl", "-lm"]
 
         # `native` selects what the binary is tuned/targeted for:
         #   "current" — tune for THIS machine's exact CPU (-march=native).

@@ -234,6 +234,110 @@ print(live_mode.width)    # reads directly out of GLFW's own memory
 fn glfw glfwSetGamma(monitor: void*, gamma: float) as set_gamma
 # some_fn(mode) where some_fn's param is void* — just works
 
+# -----------------------------------------
+# PASS/RETURN A STRUCT BY VALUE
+# -----------------------------------------
+
+# The `void*` form above sends the struct's ADDRESS — most C APIs that
+# hand you a struct work that way. Some C functions instead want the
+# struct's actual bytes copied straight into the call (or handed back
+# straight out of it), not an address at all — a bare struct name in a
+# binding's signature (no trailing '*') means exactly that:
+
+fn glfw glfwGetWindowSize(w: void*) -> Size as get_window_size  # illustrative
+fn glfw glfwResizeWindow(w: void*, s: Size) as resize_window     # illustrative
+
+let sz = get_window_size(win)      # sz.width / sz.height read normally
+resize_window(win, sz)             # sz's bytes are copied straight in
+
+# Under the hood this follows the real x86-64 C calling convention: small
+# structs (16 bytes or less) get packed into 1-2 plain registers; bigger
+# ones cross via a hidden pointer instead — handled automatically, no
+# annotation needed either way. This is ONLY relevant when the other side
+# of FFI("...") is a genuine foreign C library; a Rubidium function taking/
+# returning a bare struct type (`fn scale(s: Size) -> Size {...}`) is
+# Rubidium calling Rubidium, with no C convention to match at all.
+
+# -----------------------------------------
+# FIXED-SIZE ARRAY FIELDS
+# -----------------------------------------
+
+# Some C structs have a field that's a fixed-length row of elements BUILT
+# INTO the struct itself (C's `float m[16]`), not a separate list somewhere
+# else — a 4x4 transform matrix is the classic example. `type[N]` on a
+# field declares exactly that:
+
+struct Matrix4 {
+    m: float[16]
+}
+
+# Read/write ONE element with the same call-syntax indexing every other
+# Rubidium collection already uses (my_list(3), not my_list[3]) — get by
+# calling the field name, set with the same .set(...) convention:
+
+let mut mat = Matrix4()
+mat.m(0).set(1.0)
+let first = mat.m(0)          # 1.0
+
+# There's no whole-array read/write — `mat.m` alone (no index) is a
+# compile error; only individual elements are accessible. It's not a real
+# Rubidium `list` either (no .add()/growing) — it's always exactly N
+# elements, laid out in place exactly the way the matching C struct is.
+
+# -----------------------------------------
+# POINTER-TO-POINTER
+# -----------------------------------------
+
+# void* / char* are "the address of some data". Occasionally a C API hands
+# back (or wants) the address of WHERE an address itself is stored — one
+# more level of indirection, spelled with a second '*': `void**` / `char**`.
+# Real example: an API that writes its actual result address into a slot
+# whose address you gave it, or — as below — one that just hands the
+# address of an already-existing pointer back to you:
+
+fn glfw get_double_ptr() -> void** as get_double_ptr
+fn glfw read_through_double_ptr(pp: void**) -> int as read_through
+
+let dp: void** = get_double_ptr()
+let val = read_through_double_ptr(dp)
+
+# Scope: STORE a void**/char** you're handed and PASS IT ALONG to another
+# binding — there's no way yet to take "the address of" an existing
+# Rubidium variable to manufacture a NEW void** out-parameter yourself
+# (e.g. `some_c_fn(&my_var)`-style C code) — only receiving/relaying one
+# that already came from C.
+
+# -----------------------------------------
+# NESTED STRUCTS
+# -----------------------------------------
+
+# A struct field can be ANOTHER already-declared struct, EMBEDDED directly
+# — the whole sub-struct's bytes sit right there in place, not a separate
+# allocation somewhere else pointed at:
+
+struct Point {
+    x: int
+    y: int
+}
+
+struct Circle {
+    position: Point
+    radius: int
+}
+
+let mut c = Circle()
+c.position.x = 5
+c.position.y = 7
+c.radius = 3
+print(c.position.x)   # 5 — reads/writes straight through, any depth
+
+# `position: Point*` (a trailing '*') means a POINTER to a separate Point
+# instead — same by-value-vs-pointer convention a function signature
+# already uses for structs (see PASS/RETURN A STRUCT BY VALUE). Only the
+# embedded (bare, no '*') form supports chained '.field.field' access
+# today — reading through a struct-pointer field needs its own handling,
+# not yet built.
+
 
 # =========================================
 # VARIABLES
@@ -1757,6 +1861,17 @@ let results: list = retrieve.list(out_buf, i32, 3)
 #   direction in the name is a readability convention, not enforced.
 # - Conversions that may lose precision must be explicit, same as `as`.
 # - Null can be cast to any pointer type.
+# - retrieve.X() on an UNSIGNED LIB source (uchar, ushort, uint, ulong,
+#   ulonglong, uint8/16/32/64/128, size_t, uintptr_t) lands on a WIDER
+#   Rubidium int than that same width would normally give you — e.g.
+#   retrieve.uint32 gives you an i64, not an i32 — specifically so a huge
+#   unsigned C value (Rubidium has no unsigned concept at all) can never
+#   come back misread as negative:
+# fn lib big_u32() -> unsigned int as big_u32
+# let raw = big_u32()              -- some C fn returning unsigned int
+# let safe = retrieve.uint32(raw)  -- an i64, always the correct positive value
+# cast.X() (Rubidium -> C, outbound) is UNAFFECTED — the real C call still
+# needs the exact original narrow width.
 
 
 # =========================================
@@ -1838,6 +1953,54 @@ gen_buffers(1, out_buf)
 # `as alias` is required here (there's no symbol name to fall back to,
 # unlike the dlsym form). Everything else — parameter/return types,
 # calling it afterward — works exactly like any other binding.
+
+# -----------------------------------------
+# CALLBACK STRUCT FIELDS
+# -----------------------------------------
+
+# The address doesn't have to live in a plain variable — some C structs
+# have a FIELD that holds a callable address (a "vtable"-style config
+# struct, e.g. `on_resize`). `fn ptr` accepts a struct field too, not just
+# a bare variable — same idea as above, just reading the address out of
+# `.field` instead:
+
+struct Handler {
+    fn_ptr: ptr
+    tag: int
+}
+
+let mut h = Handler()
+h.fn_ptr = get_proc_address("some_c_function")
+
+fn ptr h.fn_ptr(a: int, b: int) -> int as call_handler
+call_handler(3, 4)
+
+# -----------------------------------------
+# VARIADIC FUNCTIONS
+# -----------------------------------------
+
+# Some C functions (printf-style) take a flexible number of arguments — end
+# a binding's parameter list with `...` (must be last) to declare one:
+
+let libc = FFI("libc.so.6")
+
+fn libc printf(fmt: char*, ...) as c_printf
+
+c_printf(cast.cstr("%d + %d = %d\n"), 3, 4, 7)
+
+# `fmt` is the only FIXED, typed parameter — anything past it is the
+# variadic tail, and a call can pass any number of them (at least the fixed
+# ones are still required). Each extra argument is promoted the same way C
+# itself promotes a variadic argument: a float widens to double, anything
+# narrower than a plain int (bool, a byte) widens to i32 — matching what a
+# real C variadic function like printf always expects to read, regardless
+# of the value's own natural width.
+#
+# There's no way to genuinely FORWARD a variadic call through an
+# intermediate Rubidium function (`fn relay(fmt: char*, ...) { c_printf(fmt,
+# ...) }`) — each call site's own argument types have to be known to build
+# the call, and an intermediate function has no way to know what a LATER
+# caller will eventually pass it. Call the binding directly.
 
 # -----------------------------------------
 # FFI FUNCTION RENAMING

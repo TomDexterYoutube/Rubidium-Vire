@@ -321,17 +321,26 @@ class FFIBind:
     """fn lib symbol(params) -> ret as alias — binds a symbol from a loaded FFI handle.
 
     syntax: FFI — `fn ptr raw(params) -> ret as alias` is the other shape:
-    is_ptr_bind=True means handle_name is instead the NAME of a `ptr`-typed
-    variable already holding a resolved function address (e.g. from
+    is_ptr_bind=True means handle_name is instead a `ptr`-shaped EXPRESSION
+    already holding a resolved function address (e.g. from
     glXGetProcAddress) — call through that address directly, no dlsym
-    lookup by name at all. symbol_name is unused in this form."""
-    def __init__(self, handle_name, symbol_name, params, ret_type, alias=None, is_ptr_bind=False):
+    lookup by name at all. symbol_name is unused in this form. Either a
+    plain variable name (str, the original form) or a FieldAccess node
+    (`fn ptr cfg.on_resize(...)` — a struct field holding a callable
+    address, see syntax's CALLBACK STRUCT FIELDS)."""
+    def __init__(self, handle_name, symbol_name, params, ret_type, alias=None, is_ptr_bind=False, is_variadic=False):
         self.handle_name = handle_name
         self.symbol_name = symbol_name
         self.params      = params
         self.ret_type    = ret_type
         self.alias       = alias    # Rubidium-side callable name; falls back to symbol_name
         self.is_ptr_bind = is_ptr_bind
+        # syntax: FFI > VARIADIC FUNCTIONS — `fn lib printf(fmt: char*, ...)
+        # as c_printf`. `params` holds only the FIXED, typed prefix; a call
+        # site may pass any number of EXTRA arguments past that, each
+        # individually type-coerced the same way any other LIB-typed value
+        # is (see emit_call_expr's variadic-tail handling).
+        self.is_variadic = is_variadic
 
 
 # File handle nodes

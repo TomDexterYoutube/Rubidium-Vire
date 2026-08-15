@@ -61,7 +61,11 @@ TOKEN_SPEC = [
     # DATA pointer. `fn ptr raw(...)` (see the parser) checks for this exact
     # token value right after `fn` to recognize the "bind against an
     # already-resolved address" form.
-    ("TYPE",     r"\bstr\+|\bdict\+|\bSY\b|\bptr\b|\b(?:i32|i64|i128|i256|i512|i1024|i2048|f32|f64|f128|f256|f512|f1024|f2048|str|bool|list|index|dict|Any|void|char|short|int|long|float|double|size_t|ptrdiff_t|intptr_t|uintptr_t|int8_t|uint8_t|int16_t|uint16_t|int32_t|uint32_t|int64_t|uint64_t|int128_t|uint128_t)\b"),
+    # "_Bool" (C99's real boolean type, one byte — see LIB_TYPE_TO_IR's own
+    # comment for why it's distinct from Rubidium's own "bool") must come
+    # before the general \b(?:...)\b group below, since a leading '_' isn't
+    # a \b word-boundary-safe prefix to just fold into that alternation.
+    ("TYPE",     r"\bstr\+|\bdict\+|\bSY\b|\bptr\b|_Bool\b|\b(?:i32|i64|i128|i256|i512|i1024|i2048|f32|f64|f128|f256|f512|f1024|f2048|str|bool|list|index|dict|Any|void|char|short|int|long|float|double|size_t|ptrdiff_t|intptr_t|uintptr_t|int8_t|uint8_t|int16_t|uint16_t|int32_t|uint32_t|int64_t|uint64_t|int128_t|uint128_t)\b"),
     ("LOCAL",    r"\blocal\b"),
     ("OPEN",     r"\bopen\b"),
     # syntax: FFI CALLBACKS — `fn callback name(...) { ... }`, a soft
@@ -82,6 +86,10 @@ TOKEN_SPEC = [
     ("RBRACKET", r"\]"),
     ("COMMA",    r","),
     ("COLON",    r":"),
+    # syntax: FFI > VARIADIC FUNCTIONS — `fn lib printf(fmt: char*, ...) as
+    # c_printf`. Must come before the single-DOT pattern (alternation is
+    # ordered, longest-match-first — same reasoning as "**" before "*").
+    ("ELLIPSIS", r"\.\.\."),
     ("DOT",      r"\."),
 
     ("COMMENT",  r"#[^\n]*"),

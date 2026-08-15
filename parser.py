@@ -145,13 +145,24 @@ class Parser:
 
         name = f"{prefix} {base}" if prefix else base
 
-        # Raw C pointer: a base type directly followed by '*' (void*, char*).
-        # Only meaningful right after a TYPE in a type-annotation position,
-        # so this never eats a real multiplication operator elsewhere.
+        # Raw C pointer: a base type directly followed by '*' (void*, char*)
+        # — a LOOP, not a single check, so a second '*' (void**, char**: an
+        # address of an address, e.g. a C API that hands back the address
+        # of where it wrote a result address) keeps composing instead of
+        # being left for the next token to (mis)parse. Only meaningful
+        # right after a TYPE in a type-annotation position, so this never
+        # eats a real multiplication operator elsewhere.
+        #
+        # The lexer's OP regex matches "**" (Python-style exponent) as ONE
+        # token before falling back to a lone "*" (alternation is ordered),
+        # so `void**` never actually produces two separate "*" tokens here
+        # — it's one OP token whose VALUE is the two-character string "**".
+        # Handle both shapes.
         nxt = self.peek()
-        if nxt and nxt[0] == "OP" and nxt[1] == "*":
+        while nxt and nxt[0] == "OP" and nxt[1] in ("*", "**"):
             self.advance()
-            name = f"{name}*"
+            name = name + nxt[1]
+            nxt = self.peek()
 
         return name
 
@@ -338,12 +349,35 @@ class Parser:
             if fname is None:
                 raise SyntaxError(f"Line {self.line_no}: expected a field name inside struct '{name}', got {self.peek()}")
             self.expect("COLON", f"':' after struct field '{fname}'")
-            ftype = self.match_type()
+            # syntax: DATA TYPES > STRUCT — a field can also be another
+            # already-declared struct, EMBEDDED directly (bare name — same
+            # by-value convention a function signature uses) or a POINTER
+            # to one (`OtherStruct*`) — a user-defined struct name lexes as
+            # a plain IDENT, same gap match_ident_type() already covers for
+            # function signatures.
+            ftype = self.match_type() or self.match_ident_type()
             if ftype is None:
                 raise SyntaxError(
-                    f"Line {self.line_no}: expected a LIB type for struct field '{name}.{fname}' "
-                    f"(struct fields are raw C types — see DATA TYPES > LIB)"
+                    f"Line {self.line_no}: expected a LIB type or struct name for struct field "
+                    f"'{name}.{fname}' (struct fields are raw C types, or another struct — "
+                    f"see DATA TYPES > LIB / STRUCT)"
                 )
+            # syntax: DATA TYPES > STRUCT — a fixed-size array field, C's
+            # `float m[16]` built right into the struct (a real, in-place
+            # block of N elements, not a separate allocation). Encoded as
+            # one composed type string ("float[16]") the same way "char*"/
+            # "unsigned int" already are — struct_field_index/emit_struct_
+            # type in codegen.py split it back apart when they need to.
+            if self.peek() and self.peek()[0] == "LBRACKET":
+                self.match("LBRACKET")
+                count_tok = self.match("NUMBER")
+                if count_tok is None:
+                    raise SyntaxError(
+                        f"Line {self.line_no}: expected an array length after '[' for "
+                        f"struct field '{name}.{fname}' (e.g. 'm: float[16]')"
+                    )
+                self.expect("RBRACKET", f"']' after array length for struct field '{name}.{fname}'")
+                ftype = f"{ftype}[{count_tok}]"
             fields.append((fname, ftype))
         self.expect("RBRACE", f"'}}' to close struct '{name}'")
         return StructDef(name, fields)
@@ -436,12 +470,23 @@ class Parser:
         # which expects that position to be a library handle IDENT.
         if self.peek() and self.peek()[0] == "TYPE" and self.peek()[1] == "ptr":
             self.match("TYPE")
-            ptr_var_name = self.match("IDENT")
-            if ptr_var_name is None:
+            base_name = self.match("IDENT")
+            if base_name is None:
                 raise SyntaxError(
                     f"Line {self.line_no}: expected a variable name after 'fn ptr' "
-                    f"(the ptr-typed variable holding the address to bind against)"
+                    f"(the ptr-typed variable/field holding the address to bind against)"
                 )
+            # syntax: FFI CALLBACKS > CALLBACK STRUCT FIELDS — the address
+            # can also live in a struct FIELD (`fn ptr cfg.on_resize(...)`),
+            # not just a bare variable — any number of '.field' hops after
+            # the base name. handle_name ends up either the plain string
+            # (bare-variable form, unchanged) or a FieldAccess chain.
+            ptr_var_name = base_name
+            while self.peek() and self.peek()[0] == "DOT":
+                self.match("DOT")
+                attr = self.match_attr()
+                base_obj = Var(ptr_var_name) if isinstance(ptr_var_name, str) else ptr_var_name
+                ptr_var_name = FieldAccess(base_obj, attr)
             self.match("LPAREN")
             params = []
             while self.peek() and self.peek()[0] != "RPAREN":
@@ -482,7 +527,21 @@ class Parser:
             symbol_name = self.match("IDENT")
             self.match("LPAREN")
             params = []
+            is_variadic = False
             while self.peek() and self.peek()[0] != "RPAREN":
+                # syntax: FFI > VARIADIC FUNCTIONS — `...` must be the LAST
+                # thing before ')' (matches C's own rule: a fixed prefix of
+                # named/typed params, then a variable tail with no type of
+                # its own).
+                if self.peek()[0] == "ELLIPSIS":
+                    self.match("ELLIPSIS")
+                    is_variadic = True
+                    if self.peek() and self.peek()[0] == "COMMA":
+                        raise SyntaxError(
+                            f"Line {self.line_no}: '...' must be the LAST parameter "
+                            f"in a variadic FFI binding"
+                        )
+                    break
                 pname = self.match("IDENT") or self.match("TYPE")
                 # BUGFIX (found bringing up FFI CALLBACKS): a param name that
                 # matches neither token type (a keyword — e.g. `callback`,
@@ -539,7 +598,7 @@ class Parser:
             if self.peek() and self.peek()[0] == "AS":
                 self.match("AS")
                 alias = self.match("IDENT")
-            return FFIBind(name, symbol_name, params, ret_type, alias=alias)
+            return FFIBind(name, symbol_name, params, ret_type, alias=alias, is_variadic=is_variadic)
         # Normal function
         # BUGFIX (bugs.log #2): the spec's `fn (function_name) { ... }` form
         # has NO parameter-list parentheses at all — the substituted name

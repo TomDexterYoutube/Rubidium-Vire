@@ -511,11 +511,15 @@ class Analyzer:
                                f"FFI binding '{callable_name}', return type: {FFI_FORBIDDEN_TYPES[node.ret_type]}")
                 if callable_name and callable_name not in self.functions:
                     self.functions[callable_name] = {
-                        'params':   node.params,
-                        'defaults': getattr(node, 'defaults', {}),
-                        'ret_type': node.ret_type,
-                        'used':     False,
-                        'line':     None,
+                        'params':     node.params,
+                        'defaults':   getattr(node, 'defaults', {}),
+                        'ret_type':   node.ret_type,
+                        'used':       False,
+                        'line':       None,
+                        # syntax: FFI > VARIADIC FUNCTIONS — a call may pass
+                        # any number of arguments PAST 'params' (the fixed
+                        # prefix only) — see _resolve_call_args' allow_extra.
+                        'is_variadic': getattr(node, 'is_variadic', False),
                     }
         for node in nodes:
             self._find_thread_fns(node)
@@ -1587,7 +1591,7 @@ class Analyzer:
         for stmt in (node.else_body or []):
             self._node(stmt, scope)
 
-    def _resolve_call_args(self, fn_name, params, defaults, args):
+    def _resolve_call_args(self, fn_name, params, defaults, args, allow_extra=False):
         """Static-analyzer counterpart of codegen.py's _resolve_call_args —
         kept logically in sync so the debugger doesn't reject (or wrongly
         allow) something the real compiler decides differently. Matches a
@@ -1597,9 +1601,13 @@ class Analyzer:
         on failure it has already emitted an ERROR issue itself and returns
         (False, None) — the caller should skip further per-parameter type
         checking, since the binding itself is broken.
+
+        allow_extra=True (syntax: FFI > VARIADIC FUNCTIONS): `params` is
+        only the FIXED, typed prefix — any number of arguments at or past
+        that count is valid, appended after the resolved fixed ones.
         """
         has_kwargs = any(isinstance(a, ast.KwArg) for a in args)
-        if not has_kwargs and len(args) == len(params):
+        if not has_kwargs and (len(args) == len(params) or (allow_extra and len(args) >= len(params))):
             return True, args  # fast path — unaffected by this feature at all
 
         param_names = [pn for pn, _ in params]
@@ -1608,6 +1616,7 @@ class Analyzer:
 
         pos_i = 0
         seen_named = False
+        extra = []
         for a in args:
             if isinstance(a, ast.KwArg):
                 seen_named = True
@@ -1628,6 +1637,9 @@ class Analyzer:
                                f"Function '{fn_name}': positional argument follows a named one")
                     return False, None
                 if pos_i >= len(params):
+                    if allow_extra:
+                        extra.append(a)
+                        continue
                     self._emit('ERROR', None, 'Function Argument Error',
                                f"Function '{fn_name}' expects {len(params)} argument(s), got more")
                     return False, None
@@ -1645,7 +1657,7 @@ class Analyzer:
                                f"Function '{fn_name}' missing required argument '{pn}'")
                     return False, None
 
-        return True, resolved
+        return True, resolved + extra
 
     def _fn_call(self, node: ast.FnCall, scope: Scope):
         name = node.name if isinstance(node.name, str) else None
@@ -1726,7 +1738,8 @@ class Analyzer:
             self.functions[name]['used'] = True
             params = self.functions[name].get('params') or []
             defaults = self.functions[name].get('defaults') or {}
-            ok, resolved = self._resolve_call_args(name, params, defaults, node.args)
+            is_variadic = self.functions[name].get('is_variadic', False)
+            ok, resolved = self._resolve_call_args(name, params, defaults, node.args, allow_extra=is_variadic)
             if ok:
                 for arg, (pname, ptype) in zip(resolved, params):
                     if ptype and ptype != 'Any':
