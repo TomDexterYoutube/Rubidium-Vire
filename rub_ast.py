@@ -205,6 +205,17 @@ class ClassInstantiate:
     def __init__(self, class_name):
         self.class_name = class_name
 
+# syntax: DATA TYPES > STRUCT — a raw C-layout block of named fields, for
+# APIs that hand you (or want from you) memory shaped like a real C struct
+# (GLFWvidmode and friends) rather than a Rubidium %Box*/class instance.
+# No methods, no mutability modifiers — every field is just a LIB type in
+# declared order; codegen lays it out as a real (non-packed) LLVM struct
+# type, so alignment/padding match the target's C ABI automatically.
+class StructDef:
+    def __init__(self, name, fields):
+        self.name = name
+        self.fields = fields   # [(field_name, lib_type_str), ...], declaration order
+
 # BUGFIX/FEATURE (bugs.log #9): runtime SY reflection. `let x: SY = <expr>`
 # is now a real runtime string variable (see parser.py), so a name generated
 # from it (e.g. inside a loop, via concatenation) can differ every iteration.
@@ -307,13 +318,20 @@ class FFILoad:
         self.path_expr = path_expr
 
 class FFIBind:
-    """fn lib symbol(params) -> ret as alias — binds a symbol from a loaded FFI handle"""
-    def __init__(self, handle_name, symbol_name, params, ret_type, alias=None):
+    """fn lib symbol(params) -> ret as alias — binds a symbol from a loaded FFI handle.
+
+    syntax: FFI — `fn ptr raw(params) -> ret as alias` is the other shape:
+    is_ptr_bind=True means handle_name is instead the NAME of a `ptr`-typed
+    variable already holding a resolved function address (e.g. from
+    glXGetProcAddress) — call through that address directly, no dlsym
+    lookup by name at all. symbol_name is unused in this form."""
+    def __init__(self, handle_name, symbol_name, params, ret_type, alias=None, is_ptr_bind=False):
         self.handle_name = handle_name
         self.symbol_name = symbol_name
         self.params      = params
         self.ret_type    = ret_type
         self.alias       = alias    # Rubidium-side callable name; falls back to symbol_name
+        self.is_ptr_bind = is_ptr_bind
 
 
 # File handle nodes

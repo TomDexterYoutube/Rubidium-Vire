@@ -25,6 +25,7 @@ TOKEN_SPEC = [
     ("MUT",      r"mut\b"),
     ("FN",       r"fn\b"),
     ("CLASS",    r"class\b"),
+    ("STRUCT",   r"struct\b"),   # syntax: DATA TYPES > STRUCT
     ("IF",       r"if\b"),
     ("ELSE",     r"else\b"),
     ("WHILE",    r"while\b"),
@@ -49,7 +50,18 @@ TOKEN_SPEC = [
     ("OR",       r"or\b"),
     ("NOT",      r"not\b"),
 
-    ("TYPE",     r"\bstr\+|\bdict\+|\bSY\b|\b(?:i32|i64|i128|i256|i512|i1024|i2048|f32|f64|f128|f256|f512|f1024|f2048|str|bool|list|index|dict|Any|void)\b"),
+    # LIB types (syntax's DATA TYPES > LIB section) — raw C primitive types,
+    # only meaningful at an FFI boundary (a binding signature, a callback
+    # signature, or a cast.X()/retrieve.X() target — see CONVERSION).
+    # "unsigned"/"signed" and the "long long"/"long double" compounds are
+    # NOT single tokens — the parser recognizes those as two adjacent TYPE
+    # tokens (see match_type()) rather than growing this regex further.
+    # "ptr" (syntax's FFI section): a raw function-pointer-shaped address,
+    # e.g. from glXGetProcAddress — distinct from void*, which is a generic
+    # DATA pointer. `fn ptr raw(...)` (see the parser) checks for this exact
+    # token value right after `fn` to recognize the "bind against an
+    # already-resolved address" form.
+    ("TYPE",     r"\bstr\+|\bdict\+|\bSY\b|\bptr\b|\b(?:i32|i64|i128|i256|i512|i1024|i2048|f32|f64|f128|f256|f512|f1024|f2048|str|bool|list|index|dict|Any|void|char|short|int|long|float|double|size_t|ptrdiff_t|intptr_t|uintptr_t|int8_t|uint8_t|int16_t|uint16_t|int32_t|uint32_t|int64_t|uint64_t|int128_t|uint128_t)\b"),
     ("LOCAL",    r"\blocal\b"),
     ("OPEN",     r"\bopen\b"),
     # syntax: FFI CALLBACKS — `fn callback name(...) { ... }`, a soft

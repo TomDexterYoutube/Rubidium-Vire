@@ -688,6 +688,50 @@ void list_append(Box* lst, Box* b) {
     if(l->count==l->cap){l->cap*=2; l->items=realloc(l->items,l->cap*sizeof(Box*));}
     l->items[l->count++]=b;
 }
+// syntax: CONVERSION — cast.buffer(list, elem_type) flattens a Rubidium
+// list into a raw, contiguous C-compatible buffer (no Box wrapper, no
+// per-element indirection) — the shape a C function expecting an array
+// actually wants (e.g. glBufferData's `const void* data`). elem_kind is a
+// small compile-time-known tag codegen picks from the requested element
+// type: 0=i32, 1=i64, 2=f32, 3=f64 — the only widths a real C ABI uses.
+// Caller owns the returned buffer (free() it, or let the temp arena do so
+// if it was tracked at the call site).
+void* list_to_flat_buffer(Box* list_box, int elem_kind) {
+    if (!list_box || list_box->type != 3) return NULL;
+    int* magic = (int*)list_box->p;
+    if (!magic || *magic != 1) return NULL;
+    RList* l = (RList*)list_box->p;
+    size_t elem_sz = (elem_kind == 0) ? sizeof(int) :
+                      (elem_kind == 1) ? sizeof(long long) :
+                      (elem_kind == 2) ? sizeof(float) : sizeof(double);
+    void* buf = malloc(l->count > 0 ? (size_t)l->count * elem_sz : 1);
+    for (int i = 0; i < l->count; i++) {
+        Box* e = l->items[i];
+        if (elem_kind == 0)      ((int*)buf)[i]       = (int)(e ? e->i : 0);
+        else if (elem_kind == 1) ((long long*)buf)[i]  = (e ? e->i : 0);
+        else if (elem_kind == 2) ((float*)buf)[i]      = (float)(e ? e->f : 0.0);
+        else                     ((double*)buf)[i]     = (e ? e->f : 0.0);
+    }
+    return buf;
+}
+
+// The reverse of list_to_flat_buffer: retrieve.list(ptr, elem_type, count)
+// reads `count` elements of elem_kind width out of a raw C buffer (e.g. an
+// out-parameter a C function wrote into) and builds a fresh Rubidium list
+// from them. Does not take ownership of / free buf — the caller's own
+// buffer (or a cast.buffer() result they're reading back) is untouched.
+Box* flat_buffer_to_list(void* buf, int elem_kind, int count) {
+    Box* result = make_list();
+    if (!buf || count <= 0) return result;
+    for (int i = 0; i < count; i++) {
+        if (elem_kind == 0)      list_append(result, box_i(((int*)buf)[i]));
+        else if (elem_kind == 1) list_append(result, box_i(((long long*)buf)[i]));
+        else if (elem_kind == 2) list_append(result, box_f((double)((float*)buf)[i]));
+        else                     list_append(result, box_f(((double*)buf)[i]));
+    }
+    return result;
+}
+
 // Split a string by a delimiter — returns a Box* list of string Box* parts.
 Box* str_split(char* src, char* delim) {
     Box* result = make_list();

@@ -211,6 +211,21 @@ class CodeGen:
         self.dropped_vars = set()
         self.class_defs   = {}
         self.class_ids    = {}  # bugs.log OPEN-9: class_name -> stable int id for runtime dispatch
+        self.struct_defs  = {}  # syntax: DATA TYPES > STRUCT — name -> StructDef
+        # var_name -> struct_name. Deliberately separate from self.instances
+        # (the class equivalent) — a class-copy detection elsewhere
+        # (`let p2 = p1` where p1 is a class instance) keys off
+        # `node.value.name in self.instances`, and a struct sharing that
+        # dict would misroute a plain struct-to-struct assignment through
+        # class-copy codegen that doesn't know what a struct is.
+        self.struct_instances = {}
+        # names of variables declared with a LIB pointer type (void*/char*/
+        # ptr) — see _deep_copy_if_var's use of this: void*/char*/ptr and
+        # Rubidium's own `str` all share the i8* representation, but only
+        # `str` should ever be strdup()'d on assignment (a copy of a raw
+        # address's byte pattern isn't a copy of the address — it's
+        # whatever text those bytes happen to spell, garbage).
+        self.lib_pointer_vars = set()
         self.instances    = {}
         # bugs.log #12: see _gather_vardecl_types — pre-scan-only instance
         # tracking, kept separate from self.instances (see that comment).
@@ -496,21 +511,28 @@ class CodeGen:
     _FLT_IR = {"f32": "float", "f64": "double",
                "f128": "fp128", "f256": "fp128", "f512": "fp128",
                "f1024": "fp128", "f2048": "fp128"}
-    # Rank: higher = wider. Floats outrank all ints.
+    # Rank: higher = wider. Floats outrank all ints. i8/i16 and x86_fp80
+    # (LIB types char/short and "long double" — see DATA TYPES > LIB) get
+    # fractional ranks so they slot in without renumbering every existing
+    # entry: i8 < i16 < i1(bool, rank 0)... wait, bool is a 1-bit LOGICAL
+    # type, not a narrower integer — i8/i16 rank strictly between i1 and
+    # i32, since a real C narrowing conversion never targets i1.
     _TYPE_RANK = {
-        "i1": 0, "i32": 1, "i64": 2, "i128": 3,
+        "i1": 0, "i8": 0.25, "i16": 0.5, "i32": 1, "i64": 2, "i128": 3,
         "i256": 4, "i512": 5, "i1024": 6, "i2048": 7,
-        "float": 10, "double": 11, "fp128": 12,
+        "float": 10, "double": 11, "x86_fp80": 11.5, "fp128": 12,
     }
     # Which IR types are integers vs floats
-    _INT_IR_SET  = {"i1", "i32", "i64", "i128", "i256", "i512", "i1024", "i2048"}
-    _FLOAT_IR_SET = {"float", "double", "fp128"}
+    _INT_IR_SET  = {"i1", "i8", "i16", "i32", "i64", "i128", "i256", "i512", "i1024", "i2048"}
+    _FLOAT_IR_SET = {"float", "double", "x86_fp80", "fp128"}
 
     # BUGFIX (bugs.log #4): bit widths for each signed integer IR type, used to
     # compute the min/max representable value so narrowing conversions can be
     # clamped (per syntax file's "Integer Overflow" section) instead of being
     # silently truncated. i1 (bool) is excluded — it has no overflow concept.
-    _INT_BITS = {"i32": 32, "i64": 64, "i128": 128,
+    # i8/i16 (LIB char/short) included — an FFI arg narrowed down to one of
+    # these needs the exact same overflow clamping any other width gets.
+    _INT_BITS = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "i128": 128,
                  "i256": 256, "i512": 512, "i1024": 1024, "i2048": 2048}
 
     def _int_bounds(self, ir_type):
@@ -531,18 +553,148 @@ class CodeGen:
         if t in self._TYPE_RANK: return t
         return "i64"
 
+    # LIB types (syntax's DATA TYPES > LIB section) -> raw LLVM IR type.
+    # Targets the one platform this whole toolchain actually builds for
+    # (Linux x86_64, LP64: long/size_t/pointers are all 64-bit) — same
+    # assumption the rest of this compiler already makes (e.g. FFI's
+    # bundled-.so path, the FFI wrapper's own README). Every entry here is a
+    # RAW pointer-sized-or-narrower scalar with a well-defined C ABI layout,
+    # which is exactly the boundary cast.X()/retrieve.X() and a raw FFI
+    # binding's signature both cross — see CONVERSION and the FFI section.
+    LIB_TYPE_TO_IR = {
+        "char": "i8", "signed char": "i8", "unsigned char": "i8",
+        "short": "i16", "unsigned short": "i16",
+        "int": "i32", "unsigned int": "i32",
+        "long": "i64", "unsigned long": "i64",
+        "long long": "i64", "unsigned long long": "i64",
+        "int8_t": "i8", "uint8_t": "i8",
+        "int16_t": "i16", "uint16_t": "i16",
+        "int32_t": "i32", "uint32_t": "i32",
+        "int64_t": "i64", "uint64_t": "i64",
+        "int128_t": "i128", "uint128_t": "i128",
+        "size_t": "i64", "ptrdiff_t": "i64",
+        "intptr_t": "i64", "uintptr_t": "i64",
+        "float": "float", "double": "double", "long double": "x86_fp80",
+        "void*": "i8*", "char*": "i8*",
+        # "ptr" — a raw function-pointer-shaped address (see the FFI
+        # section's `fn ptr raw(...)` binding form). Same i8* IR
+        # representation as void*/char* (a pointer is a pointer at the ABI
+        # level); kept as its own name so `let raw: ptr = ...` reads as
+        # "this specific value is meant to be called through," not "this is
+        # opaque data."
+        "ptr": "i8*",
+    }
+
+    # syntax: FFI — dict/dict+/index have no C-compatible layout and no
+    # conversion route (unlike list, which gets cast.list/retrieve.list),
+    # so they're rejected outright as an FFI binding or callback's
+    # parameter/return type. Previously these silently fell back through
+    # _ffi_type_to_ir -> rubi_type_to_ir to "%Box*" and compiled with zero
+    # warning even when the other side was a genuine foreign C library that
+    # has no idea what a %Box* is — a real Rubidium.so on the other end
+    # (the one case this used to legitimately support) is no longer
+    # special-cased; the FFI boundary now always requires the routes below.
+    _FFI_FORBIDDEN_TYPES = {
+        "dict": "dict can't cross an FFI boundary — it has no C-compatible layout and no conversion route. Keep dicts on the Rubidium side of the call.",
+        "dict+": "dict+ can't cross an FFI boundary — it has no C-compatible layout and no conversion route. Keep dicts on the Rubidium side of the call.",
+        "index": "index can't cross an FFI boundary — it has no C-compatible layout and no conversion route. Keep it on the Rubidium side of the call.",
+        "list": "list can't cross an FFI boundary directly — flatten it first with cast.list(list, elem_type), and read a written buffer back with retrieve.list(ptr, elem_type, count).",
+    }
+
+    def _reject_ffi_boxtype(self, t, where):
+        if t in self._FFI_FORBIDDEN_TYPES:
+            raise RubidiumTypeError(f"{where}: {self._FFI_FORBIDDEN_TYPES[t]}")
+
     def _ffi_type_to_ir(self, t):
-        """Type mapping for FFI-bound function signatures. FFI now only
-        targets OTHER RUBIDIUM-COMPILED shared libraries (`FFI("lib.so")`
-        where lib.so was itself built by this compiler with `-s`) — both
-        sides share the exact same %Box*/RList/RDict layout, so there's no
-        foreign-C-ABI mismatch to guard against. A parameter/return type is
-        just whatever the real Rubidium type is (dict+, list, Any, a class
-        instance, ...), same as an ordinary function — the only thing this
-        adds over rubi_type_to_ir is 'void', meaningful for an FFI return
-        type (no return value at all) but not a real Rubidium type."""
+        """Type mapping for FFI-bound function signatures, callback
+        signatures, and cast.X()/retrieve.X() targets. Two kinds of type can
+        appear here:
+          - A real Rubidium type (dict+, list, Any, i32, a class instance,
+            ...) — for when the loaded .so is ITSELF Rubidium-compiled
+            (`FFI("lib.so")` where lib.so was built by this compiler with
+            `-s`); both sides share the exact same %Box* layout, so it
+            crosses directly, same as an ordinary same-file call.
+          - A LIB type (see LIB_TYPE_TO_IR above) — for when the loaded .so
+            is a genuine foreign C library; these have a real, fixed raw-ABI
+            shape that doesn't go through %Box* at all.
+        Both are legal in the same binding's signature (mix and match per
+        parameter) since nothing about resolving one depends on the other.
+        'void' is the one addition over rubi_type_to_ir: meaningful as an
+        FFI return type (no return value at all) but not a real value type."""
+        if t in self.LIB_TYPE_TO_IR: return self.LIB_TYPE_TO_IR[t]
         if t == "void": return "void"
+        # syntax: DATA TYPES > STRUCT — a bare struct name in a function
+        # SIGNATURE (param/return type) means pass/return the struct's
+        # actual bytes BY VALUE (see emit_fn's param spill and coerce's
+        # %struct_X* -> %struct_X case). An explicit trailing '*'
+        # (StructName*) means by pointer instead — the address-only form
+        # every struct reference used before by-value existed, still what
+        # `let mode: GLFWvidmode = ptr_expr` (the VIEW form) itself resolves
+        # to internally, just via struct_ir_type directly rather than here.
+        if t in self.struct_defs: return self.struct_ir_type(t)
+        if t.endswith("*") and t[:-1] in self.struct_defs:
+            return f"{self.struct_ir_type(t[:-1])}*"
         return self.rubi_type_to_ir(t)
+
+    # cast.X(value) / retrieve.X(value) — see CONVERSION. X is a METHOD
+    # NAME, so it can't be spelled exactly like a multi-word LIB type
+    # ("unsigned int") or one with a literal '*' in it ("char*") — those get
+    # a single-word alias here instead. Single-word LIB types (int, char,
+    # long, double, ...) keep their own name unchanged.
+    _CAST_METHOD_TO_LIB_TYPE = {
+        "char": "char", "schar": "signed char", "uchar": "unsigned char",
+        "short": "short", "ushort": "unsigned short",
+        "int": "int", "uint": "unsigned int",
+        "long": "long", "ulong": "unsigned long",
+        "longlong": "long long", "ulonglong": "unsigned long long",
+        "int8": "int8_t", "uint8": "uint8_t",
+        "int16": "int16_t", "uint16": "uint16_t",
+        "int32": "int32_t", "uint32": "uint32_t",
+        "int64": "int64_t", "uint64": "uint64_t",
+        "int128": "int128_t", "uint128": "uint128_t",
+        "size_t": "size_t", "ptrdiff_t": "ptrdiff_t",
+        "intptr_t": "intptr_t", "uintptr_t": "uintptr_t",
+        "float": "float", "double": "double", "longdouble": "long double",
+        "voidptr": "void*", "cstr": "char*", "ptr": "ptr",
+    }
+    # Real Rubidium type names valid as a cast.X()/retrieve.X() target
+    # (cast.i32(x), retrieve.Any(ptr), ...) — deliberately NOT the same
+    # lookup rubi_type_to_ir does internally, since that function has a
+    # silent "i64" fallback for anything unrecognized and a typo'd method
+    # name (cast.i33(x)) should be a clear compile error, not a quiet
+    # wrong-type cast.
+    _CAST_RUBI_TARGETS = {
+        "list", "index", "dict", "dict+", "Any", "bool", "str", "str+", "SY",
+        "i32", "i64", "i128", "i256", "i512", "i1024", "i2048",
+        "f32", "f64", "f128", "f256", "f512", "f1024", "f2048",
+    }
+
+    def _cast_target_ir(self, method):
+        """Resolve a cast.X()/retrieve.X() method name to its IR type, or
+        None if it isn't a valid target at all (caller raises)."""
+        if method in self._CAST_METHOD_TO_LIB_TYPE:
+            return self.LIB_TYPE_TO_IR[self._CAST_METHOD_TO_LIB_TYPE[method]]
+        if method in self._CAST_RUBI_TARGETS:
+            return self.rubi_type_to_ir(method)
+        return None
+
+    # cast.list(list, elem_type) / retrieve.list(ptr, elem_type, count) —
+    # see CONVERSION. elem_type is whatever real type name a bare TYPE
+    # token parses as at a call-argument position (mirrors .to()'s handling
+    # elsewhere) — resolved via _ffi_type_to_ir (accepts both a Rubidium
+    # type like f32 and a LIB type like float) and then restricted to the
+    # 4 widths a real C ABI array actually uses.
+    _BUFFER_ELEM_KIND = {"i32": 0, "i64": 1, "float": 2, "double": 3}
+
+    def _extract_type_arg_name(self, arg):
+        """A bare TYPE-token call argument (e.g. `f32` in cast.list(x, f32))
+        parses as a Var(name)-shaped node the same way every other spot in
+        this file that accepts a bare type keyword as an argument does
+        (see the .to() handler) — pull its name/value out, or None if the
+        argument isn't shaped like a bare type keyword at all."""
+        if hasattr(arg, 'name'): return arg.name
+        if hasattr(arg, 'value'): return str(arg.value)
+        return None
 
     def promote_type(self, a, b):
         """Return the higher-ranked IR type for mixed-width arithmetic."""
@@ -807,17 +959,95 @@ class CodeGen:
     def emit_class_type(self, cls):
         field_types = []
         for f in cls.fields:
-            ir_t = self.rubi_type_to_ir(f.vtype) if f.vtype else self._infer_type(f.value)
+            ir_t = self._ffi_type_to_ir(f.vtype) if f.vtype else self._infer_type(f.value)
             field_types.append(ir_t)
         field_types_str = ", ".join(field_types)
         if not field_types_str: field_types_str = "i8"
         self.global_decls.append(f"%class_{cls.name} = type {{ {field_types_str} }}")
 
+    def struct_ir_type(self, struct_name): return f"%struct_{struct_name}"
+
+    def emit_struct_type(self, sdef):
+        # syntax: DATA TYPES > STRUCT — a real (non-packed) LLVM struct
+        # type, fields in declaration order. Non-packed means LLVM lays it
+        # out using the target's normal C ABI alignment/padding rules
+        # automatically — exactly what a raw C struct like GLFWvidmode
+        # needs, without computing offsets by hand.
+        field_types = [self._ffi_type_to_ir(ftype) for _, ftype in sdef.fields]
+        field_types_str = ", ".join(field_types) if field_types else "i8"
+        self.global_decls.append(f"{self.struct_ir_type(sdef.name)} = type {{ {field_types_str} }}")
+
+    def struct_field_index(self, struct_name, field_name):
+        sdef = self.struct_defs[struct_name]
+        for i, (fname, ftype) in enumerate(sdef.fields):
+            if fname == field_name:
+                return i, self._ffi_type_to_ir(ftype)
+        raise RubidiumNameError(f"Struct '{struct_name}' has no field '{field_name}'")
+
+    def _malloc_struct_holding(self, struct_t, val):
+        """Heap-allocate one `struct_t`-sized block and store `val` (an
+        already-%struct_t-typed value) into it; returns the typed pointer
+        tmp. Shared by every place a BY-VALUE struct (a function parameter,
+        or a call's returned struct) needs to become a real addressable
+        instance — same heap-not-stack reasoning as emit_struct_init: this
+        address is routinely handed to a raw C function or returned again,
+        and a stack slot would dangle the moment its own frame exits."""
+        size_ptr, size_int, raw_ptr, typed_ptr = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
+        self.emit(f"  {size_ptr} = getelementptr {struct_t}, {struct_t}* null, i64 1")
+        self.emit(f"  {size_int} = ptrtoint {struct_t}* {size_ptr} to i64")
+        self.emit(f"  {raw_ptr} = call i8* @malloc(i64 {size_int})")
+        self.emit(f"  {typed_ptr} = bitcast i8* {raw_ptr} to {struct_t}*")
+        self.emit(f"  store {struct_t} {val}, {struct_t}* {typed_ptr}")
+        return typed_ptr
+
+    def emit_struct_init(self, ptr_str, struct_name):
+        """`let mode = GLFWvidmode()` — allocate a fresh, zeroed instance.
+        Heap-allocated via malloc (same as a class instance) rather than a
+        stack alloca, deliberately: a struct's address is routinely handed
+        to a raw C function (see FFI), and a stack pointer would dangle the
+        moment whatever function declared it returns. Every field starts
+        zeroed — struct has no __init__/default-value concept at all, it's
+        raw C memory, not a Rubidium object."""
+        sdef = self.struct_defs[struct_name]
+        struct_t = self.struct_ir_type(struct_name)
+        size_ptr, size_int, raw_ptr, typed_ptr = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
+        self.emit(f"  {size_ptr} = getelementptr {struct_t}, {struct_t}* null, i64 1")
+        self.emit(f"  {size_int} = ptrtoint {struct_t}* {size_ptr} to i64")
+        self.emit(f"  {raw_ptr} = call i8* @malloc(i64 {size_int})")
+        self.emit(f"  {typed_ptr} = bitcast i8* {raw_ptr} to {struct_t}*")
+        self.emit(f"  store {struct_t}* {typed_ptr}, {struct_t}** {ptr_str}")
+        for i, (fname, ftype) in enumerate(sdef.fields):
+            ir_t = self._ffi_type_to_ir(ftype)
+            fptr = self.new_tmp()
+            self.emit(f"  {fptr} = getelementptr {struct_t}, {struct_t}* {typed_ptr}, i32 0, i32 {i}")
+            zero_val = {"i1": "0", "i8*": "null",
+                        "float": "0.0", "double": "0.0", "x86_fp80": "0xK00000000000000000000"}.get(
+                            ir_t, "0" if ir_t in self._INT_IR_SET else "null")
+            self.emit(f"  store {ir_t} {zero_val}, {ir_t}* {fptr}")
+
+    def emit_struct_view(self, ptr_str, struct_name, value_node):
+        """`let mode: GLFWvidmode = ptr_expr` — reinterpret an existing raw
+        pointer as this struct's shape. No allocation, no copy — same
+        address, just a differently-typed handle on it.
+
+        Deliberately does NOT go through _deep_copy_if_var/the generic
+        VarDecl path: that logic strdup()s any i8*-typed value sourced from
+        a Var (see its own comments — it can't tell a real Rubidium `str`
+        apart from a raw LIB pointer, both being i8* under the hood, so it
+        assumes str). strdup() on ptr_expr here would read the pointed-to
+        struct's raw bytes as if they were a null-terminated C string and
+        hand back a copy of THAT nonsense instead of preserving the real
+        struct address — confirmed corrupting every field read afterward."""
+        struct_t = self.struct_ir_type(struct_name)
+        val, val_t = self.emit_expr(value_node)
+        val = self.coerce(val, val_t, f"{struct_t}*")
+        self.emit(f"  store {struct_t}* {val}, {struct_t}** {ptr_str}")
+
     def field_index(self, class_name, field_name):
         cls = self.class_defs[class_name]
         for i, f in enumerate(cls.fields):
             if f.name == field_name:
-                ir_t = self.rubi_type_to_ir(f.vtype) if f.vtype else self._infer_type(f.value)
+                ir_t = self._ffi_type_to_ir(f.vtype) if f.vtype else self._infer_type(f.value)
                 return i, ir_t
         raise RubidiumNameError(f"Class '{class_name}' has no field '{field_name}'")
 
@@ -889,9 +1119,21 @@ class CodeGen:
         # (per syntax file: "Function names must be unique within a scope",
         # "Class names must be unique within a scope").
         for s in stmts:
-            if isinstance(s, ClassDef):
+            if isinstance(s, StructDef):
+                # syntax: DATA TYPES > STRUCT — checked against class/function
+                # names too, not just other structs: `struct GLFWvidmode`
+                # then `class GLFWvidmode()` (or vice versa) would otherwise
+                # silently collide in _ffi_type_to_ir's type-name resolution.
+                if s.name in self.struct_defs:
+                    raise RubidiumNameError(f"Duplicate struct definition: '{s.name}'")
+                if s.name in self.class_defs:
+                    raise RubidiumNameError(f"'{s.name}' is already a class — can't also be a struct")
+                self.struct_defs[s.name] = s
+            elif isinstance(s, ClassDef):
                 if s.name in self.class_defs:
                     raise RubidiumNameError(f"Duplicate class definition: '{s.name}'")
+                if s.name in self.struct_defs:
+                    raise RubidiumNameError(f"'{s.name}' is already a struct — can't also be a class")
                 self.class_defs[s.name] = s
                 # bugs.log OPEN-9: stable numeric id for this class, used to
                 # tag boxed instances (box_class) so a value retrieved from
@@ -925,6 +1167,7 @@ class CodeGen:
         self.local_vars_stack = [{}]
         self.collect_globals(stmts)
         for cls in self.class_defs.values(): self.emit_class_type(cls)
+        for sdef in self.struct_defs.values(): self.emit_struct_type(sdef)
 
         self.global_decls += extern_decls.split("\n")
         self.global_decls += [
@@ -952,6 +1195,8 @@ class CodeGen:
             "declare i64 @strtol(i8*, i8**, i32)", "declare i64 @atol(i8*)",
             "declare i8* @strndup(i8*, i64)", "declare i32 @fclose(i8*)",
             "declare i8* @list_combine(%Box*)",
+            "declare i8* @list_to_flat_buffer(%Box*, i32)",   # syntax: CONVERSION — cast.list(list, elem_type)
+            "declare %Box* @flat_buffer_to_list(i8*, i32, i32)",  # syntax: CONVERSION — retrieve.list(ptr, elem_type, count)
             "declare %Box* @box_deep_copy(%Box*)",
             "declare i8* @fopen(i8*, i8*)", "declare i64 @fread(i8*, i64, i64, i8*)",
             "declare i64 @fwrite(i8*, i64, i64, i8*)", "declare i64 @fseek(i8*, i64, i32)",
@@ -1016,6 +1261,17 @@ class CodeGen:
             "define void @_rubidium_ctor() {",
             "  call void @_rubidium_init_rng()",
             "  call i64 @_rubidium_init()",
+        ]
+        # syntax: EXECUTION MODEL — the user's own `fn init()`, if they wrote
+        # one, runs as part of this same constructor (right after Rubidium's
+        # own global-var init above), so it's fully set up before any
+        # exported fn is reachable from the host language. Sharing this
+        # function's error-flag check below means an uncaught error inside
+        # init() is reported and halts the load exactly like one inside
+        # Rubidium's own init would.
+        if "init" in self.functions:
+            self.fn_lines.append("  call void @init()")
+        self.fn_lines += [
             # OPEN-7: same uncaught-top-level-init-error check as the
             # executable entry path (_inject_init_call) — there is no main()
             # here to eventually catch/report it otherwise.
@@ -1300,6 +1556,16 @@ class CodeGen:
         # interpolation and string concatenation (BinOp `+`) are NOT covered
         # here — both already build a fresh malloc'd buffer of their own, so
         # copying again would just leak the original for no safety benefit.
+        # syntax: DATA TYPES > LIB — void*/char*/ptr share str's i8*
+        # representation, but they hold a raw ADDRESS, not text — strdup()ing
+        # one reads whatever bytes happen to sit at that address as if they
+        # were a C string and hands back a copy of THAT nonsense instead of
+        # the real address (confirmed corrupting a struct view exactly this
+        # way). lib_pointer_vars marks which Var names actually mean "raw
+        # pointer" so only genuine strings take the copy path below.
+        if (val_t == "i8*" and isinstance(source_node, Var)
+                and source_node.name in self.lib_pointer_vars):
+            return val
         if val_t == "i8*" and isinstance(source_node, (Var, Str, InterpolatedStr)):
             copied = self.new_tmp()
             tracked = self.new_tmp()
@@ -1356,7 +1622,7 @@ class CodeGen:
             resolved_obj = self.import_aliases.get(obj_name, obj_name)
             if isinstance(node.obj, Var) and f"{resolved_obj}_{node.method}" in self.functions:
                 fn = self.functions[f"{resolved_obj}_{node.method}"]
-                return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
+                return self._ffi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
 
             # Object is a known import alias but the method isn't registered yet
             # (e.g. imported .rub file wasn't found, or will be linked separately).
@@ -1375,7 +1641,7 @@ class CodeGen:
                 mangled = self.method_ir_name(class_name, node.method)
                 if mangled in self.functions:
                     fn = self.functions[mangled]
-                    return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
+                    return self._ffi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
                 # node.method might actually be a FIELD name being accessed via call
                 # syntax (e.g. model.input_w() reads the field, model.input_w(x) is
                 # collection access on it) — not a real method.
@@ -1393,7 +1659,7 @@ class CodeGen:
                 mangled = self.method_ir_name(class_name, node.method)
                 if mangled in self.functions:
                     fn = self.functions[mangled]
-                    return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
+                    return self._ffi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
                 cls = self.class_defs.get(class_name)
                 if cls and any(f.name == node.method for f in cls.fields):
                     return "%Box*" if node.args else self.field_index(class_name, node.method)[1]
@@ -1418,6 +1684,16 @@ class CodeGen:
                         return self.rubi_type_to_ir(arg.value)
                 return "i64"
 # Built-in module methods
+            # cast.list(list, elem_type) — 2-arg form flattens to a raw C
+            # buffer (i8*); the 1-arg form (below, generic dispatch) is the
+            # ordinary Any/box relabel to "%Box*". Same method name, disjoint
+            # arg counts, so no ambiguity.
+            if obj_name == "cast" and node.method == "list" and len(node.args) == 2: return "i8*"
+            if obj_name in ("cast", "retrieve"):
+                target_ir = self._cast_target_ir(node.method)
+                if target_ir is not None: return target_ir
+                # Unknown target — fall through to the generic "Cannot infer
+                # type" error below, same as any other unrecognized method.
             if obj_name == "net":
                 if node.method in ("find", "list", "requests", "data"): return "%Box*"
                 return "i64"  # connect/accept/close/send all return an unused i64
@@ -1441,7 +1717,7 @@ class CodeGen:
                 target_name = f"{resolved_name}_{node.method}"
                 if target_name in self.functions:
                     fn_obj = self.functions[target_name]
-                    return self.rubi_type_to_ir(fn_obj.ret_type) if fn_obj.ret_type else "i64"
+                    return self._ffi_type_to_ir(fn_obj.ret_type) if fn_obj.ret_type else "i64"
 
             # BUG-21: `helper.shared_list(2)` — an ELEMENT of an imported
             # module's collection. Not a method call at all; the module's
@@ -1492,7 +1768,7 @@ class CodeGen:
                     return "i64"
                 if name in self.functions:
                     fn = self.functions[name]
-                    return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
+                    return self._ffi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
                 # Check for class instantiation
                 if name in self.class_defs:
                     return f"{self.class_ir_type(name)}*"
@@ -1580,7 +1856,12 @@ class CodeGen:
                         continue
                 if isinstance(node.value, LinkArg) and isinstance(node.value.expr, Var):
                     self._link_aliases.append((node.name, node.value.expr.name))
-                ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
+                # _ffi_type_to_ir (not plain rubi_type_to_ir) so a `ptr`- or
+                # other LIB-typed variable (`let raw: ptr = ...` — see the
+                # FFI section's `fn ptr raw(...)` binding form) gets its
+                # real IR type here, not rubi_type_to_ir's generic i64
+                # fallback for a name it doesn't recognize.
+                ir_t = self._ffi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 type_map.setdefault(node.name, set()).add(ir_t)
             elif isinstance(node, If):
                 self._gather_vardecl_types(node.then_body, type_map)
@@ -1630,7 +1911,12 @@ class CodeGen:
                 self.declare_global(node.name, ir_t)
                 self.instances[node.name] = cn
             else:
-                ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
+                # _ffi_type_to_ir (not plain rubi_type_to_ir) so a `ptr`- or
+                # other LIB-typed variable (`let raw: ptr = ...` — see the
+                # FFI section's `fn ptr raw(...)` binding form) gets its
+                # real IR type here, not rubi_type_to_ir's generic i64
+                # fallback for a name it doesn't recognize.
+                ir_t = self._ffi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 # BUGFIX (bugs.log OPEN-10): this branch handles GLOBAL-pool
                 # VarDecls (is_local was already handled above), so it must
                 # check the GLOBAL polymorphism set and actually register the
@@ -1698,7 +1984,12 @@ class CodeGen:
                     raw_cn = self._class_instantiate_candidate(node.value)  # bugs.log OPEN-O
                     if raw_cn and (raw_cn in self.class_defs or f"main_{raw_cn}" in self.class_defs):
                         continue
-                ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
+                # _ffi_type_to_ir (not plain rubi_type_to_ir) so a `ptr`- or
+                # other LIB-typed variable (`let raw: ptr = ...` — see the
+                # FFI section's `fn ptr raw(...)` binding form) gets its
+                # real IR type here, not rubi_type_to_ir's generic i64
+                # fallback for a name it doesn't recognize.
+                ir_t = self._ffi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 type_map.setdefault(node.name, set()).add(ir_t)
             elif isinstance(node, If):
                 self._gather_local_types(node.then_body, type_map, only_local)
@@ -1741,11 +2032,17 @@ class CodeGen:
 
     def _emit_default_return(self, ret_ir, is_main):
         if is_main: self.emit("  ret i32 0")
+        elif ret_ir == "void": self.emit("  ret void")  # `ret void 0`/`ret void null` are invalid IR
         elif ret_ir == "i64": self.emit("  ret i64 0")
         elif ret_ir == "i1": self.emit("  ret i1 0")
         elif ret_ir in ("float","double"): self.emit(f"  ret {ret_ir} 0.0")
         elif ret_ir == "i8*": self.emit("  ret i8* null")
         elif ret_ir in self._INT_IR_SET: self.emit(f"  ret {ret_ir} 0")
+        # A bare struct type (pass/return BY VALUE — see coerce's
+        # %struct_X* -> %struct_X case) is an aggregate, not a pointer:
+        # `null` isn't a valid literal for it, `zeroinitializer` is.
+        elif ret_ir.startswith("%struct_") and not ret_ir.endswith("*"):
+            self.emit(f"  ret {ret_ir} zeroinitializer")
         else: self.emit(f"  ret {ret_ir} null")
 
     def emit_fn(self, node):
@@ -1759,10 +2056,51 @@ class CodeGen:
         self._gather_local_types(node.body, _type_map, only_local=False)
         self._local_polymorphic = {n for n, ts in _type_map.items() if len(ts) > 1}
 
-        ret_ir = "i32" if node.name == "main" else (self.rubi_type_to_ir(node.ret_type) if node.ret_type else "i64")
+        # syntax: EXECUTION MODEL — `fn init()` is a Vire wrapper's one
+        # exception to "nothing top level runs": the compiler calls it
+        # automatically, once, the instant the compiled .so is loaded (see
+        # _emit_global_ctor_init) — exactly the role `main()` plays for a
+        # normal executable. Forced to a fixed void()-no-args shape (that's
+        # what @llvm.global_ctors requires a constructor to look like), and
+        # given `hidden` visibility so it's NOT one of the .so's exported
+        # symbols — nothing outside the library, including the Rubidium
+        # program that FFI-loads it, can see or call it directly. It's
+        # purely internal setup, never part of the wrapper's public API.
+        # syntax: FFI CALLBACKS — same boundary as emit_ffi_bind, opposite
+        # direction (a raw C function pointer calling INTO Rubidium instead
+        # of Rubidium calling out); dict/dict+/index/list are just as
+        # meaningless to the C caller here as they are on an outbound
+        # binding, so reject them the same way.
+        if node.is_callback:
+            cb_label = f"callback fn '{node.name}'"
+            for pn, pt in node.params:
+                self._reject_ffi_boxtype(pt, f"{cb_label}, parameter '{pn}'")
+            if node.ret_type:
+                self._reject_ffi_boxtype(node.ret_type, f"{cb_label}, return type")
+
+        if node.name == "init" and node.params:
+            raise RubidiumTypeError(
+                "fn init() takes no parameters — nothing calls it directly, "
+                "so there's nothing to pass it arguments."
+            )
+        # _ffi_type_to_ir here (not plain rubi_type_to_ir) so a function
+        # declared with LIB types in its signature — an `fn callback` meant
+        # to be handed to a C library, see FFI CALLBACKS — gets ITS OWN
+        # definition emitted with the correct raw C type (e.g. i32 for
+        # `int`), not silently falling back to rubi_type_to_ir's generic i64
+        # for a name it doesn't recognize. A strict superset of
+        # rubi_type_to_ir for every other function (identical result for any
+        # real Rubidium type), so this is safe unconditionally.
+        if node.name == "init":
+            ret_ir = "void"
+        elif node.name == "main":
+            ret_ir = "i32"
+        else:
+            ret_ir = self._ffi_type_to_ir(node.ret_type) if node.ret_type else "i64"
         self._cur_fn_ret_ir = ret_ir   # Return handler uses this when fn has no declared ret type
-        param_ir = ", ".join(f"{self.rubi_type_to_ir(pt)} %param_{pn}" for pn, pt in node.params)
-        self.emit(f"define {ret_ir} @{node.name}({param_ir}) {{")
+        param_ir = ", ".join(f"{self._ffi_type_to_ir(pt)} %param_{pn}" for pn, pt in node.params)
+        visibility = "hidden " if node.name == "init" else ""
+        self.emit(f"define {visibility}{ret_ir} @{node.name}({param_ir}) {{")
         self.emit("entry:")
 
         # OPEN-7: block this function branches to (instead of crashing/silently
@@ -1773,7 +2111,24 @@ class CodeGen:
         self._fn_error_exit_label = self.new_label("fn_err_exit")
 
         for pn, pt in node.params:
-            ir_t = self.rubi_type_to_ir(pt)
+            ir_t = self._ffi_type_to_ir(pt)
+            # syntax: DATA TYPES > STRUCT — a bare-struct-typed param
+            # (pass BY VALUE) arrives as the struct's actual bytes
+            # (%param_pn has type %struct_X, not a pointer) — every other
+            # struct variable's storage is a slot HOLDING a pointer to the
+            # data (see emit_struct_init/emit_struct_view), so `.field`
+            # access, drop, etc. all assume that shape. Spill the incoming
+            # value into its own local slot, then wrap THAT address in a
+            # second slot matching the usual shape, so this parameter reads
+            # and writes exactly like an owned struct variable from here on.
+            if pt in self.struct_defs:
+                direct_ptr = self._malloc_struct_holding(ir_t, f"%param_{pn}")
+                self.local_vars_stack[-1][pn] = f"{ir_t}*"
+                self.mutable_vars.add(pn)
+                self.emit(f"  %ptr_{pn} = alloca {ir_t}*")
+                self.emit(f"  store {ir_t}* {direct_ptr}, {ir_t}** %ptr_{pn}")
+                self.struct_instances[pn] = pt
+                continue
             self.local_vars_stack[-1][pn] = ir_t
             self.mutable_vars.add(pn)  # params have no `mut` syntax; spec examples mutate them directly
             self.emit(f"  %ptr_{pn} = alloca {ir_t}")
@@ -1814,10 +2169,14 @@ class CodeGen:
         inside @name's own emit_fn-generated body) needs to be duplicated
         here. Mirrors emit_ffi_bind's trampoline, which does the same thing
         in the opposite direction (Rubidium calling into C)."""
+        # internal_* must use the SAME mapping (_ffi_type_to_ir) as emit_fn
+        # used to define @{node.name} itself just above — otherwise this
+        # trampoline's call into it uses a type that doesn't match the real
+        # function's actual signature (invalid IR) for any LIB-typed param.
         c_param_types = [self._ffi_type_to_ir(pt) for _, pt in node.params]
-        internal_param_types = [self.rubi_type_to_ir(pt) for _, pt in node.params]
+        internal_param_types = [self._ffi_type_to_ir(pt) for _, pt in node.params]
         c_ret_t = self._ffi_type_to_ir(node.ret_type) if node.ret_type else "i64"
-        internal_ret_t = self.rubi_type_to_ir(node.ret_type) if node.ret_type else "i64"
+        internal_ret_t = self._ffi_type_to_ir(node.ret_type) if node.ret_type else "i64"
 
         tramp_name = f"{node.name}_c_trampoline"
         params_ir = ", ".join(f"{t} %p{i}" for i, t in enumerate(c_param_types))
@@ -1928,9 +2287,10 @@ class CodeGen:
         self._gather_local_types(mfn.body, _type_map, only_local=True)
         self._local_polymorphic = {n for n, ts in _type_map.items() if len(ts) > 1}
         
-        struct_t, ret_ir = self.class_ir_type(class_name), (self.rubi_type_to_ir(mfn.ret_type) if mfn.ret_type else "i64")
+        # _ffi_type_to_ir (not rubi_type_to_ir) — see emit_fn's identical note.
+        struct_t, ret_ir = self.class_ir_type(class_name), (self._ffi_type_to_ir(mfn.ret_type) if mfn.ret_type else "i64")
         self._cur_fn_ret_ir = ret_ir   # Return handler uses this when method has no declared ret type
-        param_str = ", ".join([f"{struct_t}* %param___self"] + [f"{self.rubi_type_to_ir(pt)} %param_{pn}" for pn, pt in mfn.params[1:]])
+        param_str = ", ".join([f"{struct_t}* %param___self"] + [f"{self._ffi_type_to_ir(pt)} %param_{pn}" for pn, pt in mfn.params[1:]])
         self.emit(f"define {ret_ir} @{mfn.name}({param_str}) {{"  )
         self.emit("entry:")
 
@@ -1944,7 +2304,7 @@ class CodeGen:
         self.local_vars_stack[-1]["__self"] = f"{struct_t}*"
         self.instances["__self"] = class_name
         for pn, pt in mfn.params[1:]:
-            ir_t = self.rubi_type_to_ir(pt)
+            ir_t = self._ffi_type_to_ir(pt)
             self.local_vars_stack[-1][pn] = ir_t
             self.mutable_vars.add(pn)
             self.emit(f"  %ptr_{pn} = alloca {ir_t}")
@@ -2065,9 +2425,103 @@ class CodeGen:
                 is_class = True
                 is_class_copy_src = node.value.name  # source var to copy from
 
+            # syntax: DATA TYPES > STRUCT. Two shapes:
+            #   let mode = GLFWvidmode()          -- fresh, zeroed, owned (is_struct)
+            #   let mode: GLFWvidmode = ptr_expr  -- VIEW over an existing
+            #                                          pointer, no allocation;
+            #                                          falls through to the
+            #                                          ordinary scalar-like
+            #                                          path below (ir_t already
+            #                                          resolves to %struct_X*
+            #                                          via _ffi_type_to_ir, and
+            #                                          coerce() already bitcasts
+            #                                          i8*->%struct_X*) — only
+            #                                          needs instance tracking.
+            is_struct = False
+            sn = ""
+            # `let made = a_fn_that_returns_a_struct_by_value(...)` — the
+            # call's result is the struct's actual bytes (%struct_X, not a
+            # pointer — see _ffi_type_to_ir's bare-struct-name handling and
+            # coerce's %struct_X* -> %struct_X case), so it needs the same
+            # "spill into local storage, track like an owned instance"
+            # treatment a by-value struct PARAMETER gets in emit_fn. Checked
+            # before the OWNED/VIEW cases below since a struct-returning
+            # call and a struct's own no-arg constructor call look similar
+            # (both are a bare FnCall) but need different handling.
+            is_struct_byval_call = False
+            if (isinstance(node.value, FnCall) and isinstance(node.value.name, str)
+                    and not node.value.args and node.value.name in self.struct_defs):
+                sn = node.value.name
+                is_struct = True
+            elif node.vtype and node.vtype in self.struct_defs:
+                sn = node.vtype
+            elif (isinstance(node.value, FnCall) and isinstance(node.value.name, str)
+                    and node.value.name in self.functions
+                    and self.functions[node.value.name].ret_type
+                    and self.functions[node.value.name].ret_type in self.struct_defs):
+                sn = self.functions[node.value.name].ret_type
+                is_struct_byval_call = True
+            if sn:
+                self.struct_instances[node.name] = sn
+
+            # See lib_pointer_vars' own comment — recorded here so it
+            # applies uniformly regardless of which branch below actually
+            # stores the value (local, global, or a later plain re-Assign).
+            if node.vtype in ("void*", "char*", "ptr"):
+                self.lib_pointer_vars.add(node.name)
+            elif node.vtype:
+                # A genuine re-declaration with a DIFFERENT (non-pointer)
+                # type must clear a stale mark from an earlier `let` of the
+                # same name — otherwise a later legitimate `str` reusing
+                # this name would wrongly skip its own strdup.
+                self.lib_pointer_vars.discard(node.name)
+
             # Local variables are function-scoped (not global)
             if node.is_local:
-                ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
+                if is_struct:
+                    # `let local mode = GLFWvidmode()` — fresh instance,
+                    # function-scoped storage for the POINTER (the struct's
+                    # own backing memory is still heap-allocated — see
+                    # emit_struct_init — so it stays valid even though the
+                    # pointer variable holding it doesn't).
+                    struct_t = self.struct_ir_type(sn)
+                    self.local_vars_stack[-1][node.name] = f"{struct_t}*"
+                    if node.mutable: self.mutable_vars.add(node.name)
+                    ptr_str = f"%ptr_{node.name}"
+                    self.emit(f"  {ptr_str} = alloca {struct_t}*")
+                    self.emit_struct_init(ptr_str, sn)
+                    return False
+                if is_struct_byval_call:
+                    # `let made = a_fn_returning_a_struct_by_value(...)` —
+                    # spill the call's returned %struct_X value into its own
+                    # heap slot, then wrap that address the same way an
+                    # owned struct instance is (see emit_fn's identical
+                    # spill for a by-value struct PARAMETER).
+                    struct_t = self.struct_ir_type(sn)
+                    val, val_t = self.emit_expr(node.value)
+                    val = self.coerce(val, val_t, struct_t)
+                    self.local_vars_stack[-1][node.name] = f"{struct_t}*"
+                    if node.mutable: self.mutable_vars.add(node.name)
+                    direct_ptr = self._malloc_struct_holding(struct_t, val)
+                    ptr_str = f"%ptr_{node.name}"
+                    self.emit(f"  {ptr_str} = alloca {struct_t}*")
+                    self.emit(f"  store {struct_t}* {direct_ptr}, {struct_t}** {ptr_str}")
+                    return False
+                if sn:
+                    # `let local mode: GLFWvidmode = ptr_expr` — VIEW form.
+                    struct_t = self.struct_ir_type(sn)
+                    self.local_vars_stack[-1][node.name] = f"{struct_t}*"
+                    if node.mutable: self.mutable_vars.add(node.name)
+                    ptr_str = f"%ptr_{node.name}"
+                    self.emit(f"  {ptr_str} = alloca {struct_t}*")
+                    self.emit_struct_view(ptr_str, sn, node.value)
+                    return False
+                # _ffi_type_to_ir (not plain rubi_type_to_ir) so a `ptr`- or
+                # other LIB-typed variable (`let raw: ptr = ...` — see the
+                # FFI section's `fn ptr raw(...)` binding form) gets its
+                # real IR type here, not rubi_type_to_ir's generic i64
+                # fallback for a name it doesn't recognize.
+                ir_t = self._ffi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 if node.name in getattr(self, "_local_polymorphic", ()):
                     ir_t = "%Box*"
                 # Track element type for collection type enforcement (bugs.log #2)
@@ -2133,7 +2587,12 @@ class CodeGen:
                         self.emit_class_init(ptr_str, cn, init_args)
                     return False
 
-                ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
+                # _ffi_type_to_ir (not plain rubi_type_to_ir) so a `ptr`- or
+                # other LIB-typed variable (`let raw: ptr = ...` — see the
+                # FFI section's `fn ptr raw(...)` binding form) gets its
+                # real IR type here, not rubi_type_to_ir's generic i64
+                # fallback for a name it doesn't recognize.
+                ir_t = self._ffi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 if node.mutable: self.mutable_vars.add(node.name)
                 # Per spec: non-local `let` inside a class method is an IMPLICIT
                 # INSTANCE FIELD (registered by _register_implicit_class_fields),
@@ -2201,7 +2660,41 @@ class CodeGen:
                     else:
                         self.emit_class_init(f"@{ir_name}", cn, init_args)
                     return False
-                ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
+                if is_struct:
+                    # `let mode = GLFWvidmode()` — global by default, same
+                    # as everything else in this branch (see the BUGFIX note
+                    # above: a top-level `let` and one inside an ordinary
+                    # function share this exact path).
+                    struct_t = self.struct_ir_type(sn)
+                    self.declare_global(node.name, f"{struct_t}*")
+                    if node.mutable: self.mutable_vars.add(node.name)
+                    self.emit_struct_init(f"@{node.name}", sn)
+                    return False
+                if is_struct_byval_call:
+                    # `let made = a_fn_returning_a_struct_by_value(...)` at
+                    # global scope — same spill-and-wrap treatment as the
+                    # local-scope branch above.
+                    struct_t = self.struct_ir_type(sn)
+                    self.declare_global(node.name, f"{struct_t}*")
+                    if node.mutable: self.mutable_vars.add(node.name)
+                    val, val_t = self.emit_expr(node.value)
+                    val = self.coerce(val, val_t, struct_t)
+                    direct_ptr = self._malloc_struct_holding(struct_t, val)
+                    self.emit(f"  store {struct_t}* {direct_ptr}, {struct_t}** @{node.name}")
+                    return False
+                if sn:
+                    # `let mode: GLFWvidmode = ptr_expr` — VIEW form.
+                    struct_t = self.struct_ir_type(sn)
+                    self.declare_global(node.name, f"{struct_t}*")
+                    if node.mutable: self.mutable_vars.add(node.name)
+                    self.emit_struct_view(f"@{node.name}", sn, node.value)
+                    return False
+                # _ffi_type_to_ir (not plain rubi_type_to_ir) so a `ptr`- or
+                # other LIB-typed variable (`let raw: ptr = ...` — see the
+                # FFI section's `fn ptr raw(...)` binding form) gets its
+                # real IR type here, not rubi_type_to_ir's generic i64
+                # fallback for a name it doesn't recognize.
+                ir_t = self._ffi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 if node.mutable: self.mutable_vars.add(node.mutable)
                 self.declare_global(node.name, ir_t)
                 # Track element type for collection type enforcement (bugs.log #2)
@@ -2313,7 +2806,11 @@ class CodeGen:
             # 3. Only use the expression's type (val_t) as a last resort
             # This prevents `ret %Box* %t75` inside a function declared as `i64`.
             if self.cur_fn in self.functions and self.functions[self.cur_fn].ret_type:
-                expected = self.rubi_type_to_ir(self.functions[self.cur_fn].ret_type)
+                # _ffi_type_to_ir (not plain rubi_type_to_ir) so a LIB return
+                # type (e.g. `-> int`) matches the i32 emit_fn actually
+                # declared the function with, not rubi_type_to_ir's generic
+                # i64 fallback for a name it doesn't recognize.
+                expected = self._ffi_type_to_ir(self.functions[self.cur_fn].ret_type)
             else:
                 expected = getattr(self, '_cur_fn_ret_ir', val_t)
             val = self.coerce(val, val_t, expected)
@@ -2323,7 +2820,13 @@ class CodeGen:
             # caller's block-end release is what frees it. That is also why a
             # returned temporary is never double-freed: it is only ever one
             # arena entry, no matter how many frames it is passed back through.
-            self.emit(f"  ret {expected} {val}")
+            if expected == "void":
+                # `ret void 0`/`ret void null` are invalid IR — a void
+                # return (init(), or an explicit `-> void`) takes no operand
+                # at all, even for a bare `return` used as an early exit.
+                self.emit("  ret void")
+            else:
+                self.emit(f"  ret {expected} {val}")
             return True
         elif isinstance(node, FnCall): self.emit_call_expr(node)
         elif isinstance(node, MethodCall): 
@@ -3004,7 +3507,7 @@ class CodeGen:
         self.emit(f"  {typed_ptr} = bitcast i8* {raw_ptr} to {struct_t}*")
         self.emit(f"  store {struct_t}* {typed_ptr}, {struct_t}** {ptr_str}")
         for i, field in enumerate(cls.fields):
-            ir_t = self.rubi_type_to_ir(field.vtype) if field.vtype else self._infer_type(field.value)
+            ir_t = self._ffi_type_to_ir(field.vtype) if field.vtype else self._infer_type(field.value)
             fptr = self.new_tmp()
             self.emit(f"  {fptr} = getelementptr {struct_t}, {struct_t}* {typed_ptr}, i32 0, i32 {i}")
             if getattr(field, "_is_implicit_field", False):
@@ -3034,7 +3537,7 @@ class CodeGen:
             for i, arg_node in enumerate(init_args):
                 v, t = self.emit_expr(arg_node)
                 if i + 1 < len(fn.params):
-                    expected_t = self.rubi_type_to_ir(fn.params[i + 1][1])
+                    expected_t = self._ffi_type_to_ir(fn.params[i + 1][1])
                     v = self.coerce(v, t, expected_t)
                     args_ir.append(f"{expected_t} {v}")
                 else:
@@ -3055,7 +3558,7 @@ class CodeGen:
         self.emit(f"  {dst_ptr} = bitcast i8* {raw_ptr} to {struct_t}*")
         self.emit(f"  store {struct_t}* {dst_ptr}, {struct_t}** {ptr_str}")
         for i, field in enumerate(cls.fields):
-            ir_t = self.rubi_type_to_ir(field.vtype) if field.vtype else self._infer_type(field.value)
+            ir_t = self._ffi_type_to_ir(field.vtype) if field.vtype else self._infer_type(field.value)
             src_fptr, dst_fptr, fval = self.new_tmp(), self.new_tmp(), self.new_tmp()
             self.emit(f"  {src_fptr} = getelementptr {struct_t}, {struct_t}* {src_ptr}, i32 0, i32 {i}")
             self.emit(f"  {fval} = load {ir_t}, {ir_t}* {src_fptr}")
@@ -3068,6 +3571,22 @@ class CodeGen:
 
     def emit_field_assign(self, node):
         obj_name = node.obj.name if hasattr(node.obj, 'name') else node.obj
+        # syntax: DATA TYPES > STRUCT — checked first, before the class/
+        # module-qualified fallbacks below (which don't know about structs
+        # and could otherwise misroute). No mutability-declaration concept
+        # for struct fields — every field is always writable, same as C.
+        if obj_name in self.struct_instances:
+            struct_name = self.struct_instances[obj_name]
+            idx, ir_t = self.struct_field_index(struct_name, node.field)
+            struct_t = self.struct_ir_type(struct_name)
+            ptr_str, _ = self.get_var_ptr(obj_name)
+            inst_ptr = self.new_tmp(); fptr = self.new_tmp()
+            self.emit(f"  {inst_ptr} = load {struct_t}*, {struct_t}** {ptr_str}")
+            self.emit(f"  {fptr} = getelementptr {struct_t}, {struct_t}* {inst_ptr}, i32 0, i32 {idx}")
+            val, val_t = self.emit_expr(node.value)
+            val = self.coerce(val, val_t, ir_t)
+            self.emit(f"  store {ir_t} {val}, {ir_t}* {fptr}")
+            return
         # BUG-23: `helper.shared_num = 42` — assigning to an imported module's
         # variable. `helper` is a namespace, not a class instance, so this fell
         # straight through the `not in self.instances` return below and the
@@ -3235,10 +3754,11 @@ class CodeGen:
             # OPEN-4: plain (no sentinel check) — see i128 note above.
             ptr64, n = self._emit_bignum_ptr(val, val_t)
             self.emit(f'  call void @print_bignum_plain(i64* {ptr64}, i32 {n})')
-        elif val_t in ("i32", "i64"):
+        elif val_t in ("i32", "i64", "i8", "i16"):
             # OPEN-4: plain number print (no sentinel/Null check) — an explicit
             # Null was already handled above; a value at the type minimum prints
-            # as its real number, not "Null".
+            # as its real number, not "Null". i8/i16 (LIB char/short — see
+            # DATA TYPES > LIB) coerce up to i64 the same as any other width.
             cv = self.coerce(val, val_t, "i64")
             self.emit(f'  call void @print_int_plain(i64 {cv})')
         elif val_t == "fp128":
@@ -3250,7 +3770,9 @@ class CodeGen:
             # 128-bit bit pattern instead (no double intermediate).
             lo, hi = self._emit_fp128_halves(val)
             self.emit(f'  call void @print_fp128_exact(i64 {lo}, i64 {hi})')
-        elif val_t in ("float", "double"):
+        elif val_t in ("float", "double", "x86_fp80"):
+            # x86_fp80 (LIB "long double") coerces to double the same as any
+            # other float width — see DATA TYPES > LIB.
             fmt, flen = self.intern_str("%g\n")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
@@ -3277,14 +3799,14 @@ class CodeGen:
         # spec's own description: "Calling it again replaces the previous
         # output."
         val, val_t = self.emit_expr(value)
-        if val_t in ("i32", "i64", "i1", "i128", "i256", "i512", "i1024", "i2048"):
+        if val_t in ("i32", "i64", "i1", "i128", "i256", "i512", "i1024", "i2048", "i8", "i16"):
             fmt, flen = self.intern_str("\r%lld\x1b[K")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
             cv = self.coerce(val, val_t, "i64")
             self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i64 {cv})')
             self.emit(f'  call i32 @fflush(i8* null)')
-        elif val_t in ("float", "double", "fp128"):
+        elif val_t in ("float", "double", "fp128", "x86_fp80"):
             fmt, flen = self.intern_str("\r%g\x1b[K")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
@@ -4016,6 +4538,14 @@ class CodeGen:
           3. Calls it with the provided args
         We store the binding so calling symbol(args) works normally afterwards.
         """
+        # syntax: FFI — reject dict/dict+/index/list before they ever reach
+        # _ffi_type_to_ir's %Box* fallback (see _FFI_FORBIDDEN_TYPES).
+        fn_label = f"FFI binding '{node.alias or node.symbol_name}'"
+        for pn, pt in node.params:
+            self._reject_ffi_boxtype(pt, f"{fn_label}, parameter '{pn}'")
+        if node.ret_type:
+            self._reject_ffi_boxtype(node.ret_type, f"{fn_label}, return type")
+
         # Build param IR types
         param_ir_types = [self._ffi_type_to_ir(pt) for _, pt in node.params]
         # bugs.log: an FFI binding with no `-> ret` was previously assumed
@@ -4030,6 +4560,11 @@ class CodeGen:
         # reading a garbage i64 out of the return register.
         ret_ir = self._ffi_type_to_ir(node.ret_type) if node.ret_type else "void"
         fn_ptr_t = f"{ret_ir} ({', '.join(param_ir_types)})*" if param_ir_types else f"{ret_ir} ()*"
+        if node.is_ptr_bind and not node.alias:
+            raise RubidiumTypeError(
+                "fn ptr ... needs 'as alias' — there's no symbol name to fall back to "
+                "(you're binding against an address, not a dlsym-able name)."
+            )
         # Rubidium-callable name: use 'as' alias when provided, else fall back to C symbol name
         fn_name = node.alias if node.alias else node.symbol_name
         # BUGFIX (bugs.log #1): don't emit the LLVM define under a name that
@@ -4051,34 +4586,48 @@ class CodeGen:
         pending.append(f"\ndefine {ret_ir} @{safe_name}({params_ir}) {{")
         pending.append("entry:")
 
-        # Get handle index from the dedicated global slot written when FFI("path") ran.
-        # Using the slot (not a local alloca) means the wrapper always finds it.
-        slot_name = f"@_ffi_slot_{node.handle_name}"
-        # Declare the slot if not yet declared (collect pass may run before emit_ffi_bind)
-        # BUG-1 (RIG report): exact-match the declaration prefix, not a bare
-        # substring check — see the matching fix/comment at the VarDecl sites
-        # above for the full explanation (a name that's a prefix of an
-        # earlier-declared one, e.g. "gl" after "glfw", false-positived as
-        # already-declared and silently skipped emitting its own global).
-        if not any(d.startswith(f"{slot_name} =") for d in self.global_decls):
-            self.global_decls.append(f"@_ffi_slot_{node.handle_name} = global i64 -1")
-        handle_var_v = f"%ffi_h_{self.new_tmp()[1:]}"
-        pending.append(f"  {handle_var_v} = load i64, i64* {slot_name}")
-
-        # Intern the symbol name string constant
-        sym_lbl, sym_len = self.intern_str(node.symbol_name)
-        sym_ptr_t = f"%ffi_sp_{self.new_tmp()[1:]}"
-        pending.append(f"  {sym_ptr_t} = getelementptr [{sym_len} x i8], [{sym_len} x i8]* {sym_lbl}, i64 0, i64 0")
-
-        # Get raw fn pointer as i64 via ffi_sym
-        raw_fp = f"%ffi_raw_{self.new_tmp()[1:]}"
-        pending.append(f"  {raw_fp} = call i64 @ffi_sym(i64 {handle_var_v}, i8* {sym_ptr_t})")
-
-        # Null check — if symbol not resolved, skip the call and return zero/null
         ok_lbl  = f"ffi_ok_{self.new_tmp()[1:]}"
         bad_lbl = f"ffi_bad_{self.new_tmp()[1:]}"
-        is_null = f"%ffi_null_{self.new_tmp()[1:]}"
-        pending.append(f"  {is_null} = icmp eq i64 {raw_fp}, 0")
+
+        if node.is_ptr_bind:
+            # syntax: FFI — `fn ptr raw(...) as alias`. raw is an ordinary
+            # `ptr`-typed variable (i8* under the hood) already holding a
+            # resolved address (e.g. from glXGetProcAddress) — read its
+            # CURRENT value the same way any other variable read does, no
+            # dlsym/handle-slot lookup involved at all.
+            ptr_str, ptr_ir_t = self.get_var_ptr(node.handle_name)
+            raw_fp = f"%ffi_ptrbind_{self.new_tmp()[1:]}"
+            pending.append(f"  {raw_fp} = load {ptr_ir_t}, {ptr_ir_t}* {ptr_str}")
+            is_null = f"%ffi_null_{self.new_tmp()[1:]}"
+            pending.append(f"  {is_null} = icmp eq {ptr_ir_t} {raw_fp}, null")
+        else:
+            # Get handle index from the dedicated global slot written when FFI("path") ran.
+            # Using the slot (not a local alloca) means the wrapper always finds it.
+            slot_name = f"@_ffi_slot_{node.handle_name}"
+            # Declare the slot if not yet declared (collect pass may run before emit_ffi_bind)
+            # BUG-1 (RIG report): exact-match the declaration prefix, not a bare
+            # substring check — see the matching fix/comment at the VarDecl sites
+            # above for the full explanation (a name that's a prefix of an
+            # earlier-declared one, e.g. "gl" after "glfw", false-positived as
+            # already-declared and silently skipped emitting its own global).
+            if not any(d.startswith(f"{slot_name} =") for d in self.global_decls):
+                self.global_decls.append(f"@_ffi_slot_{node.handle_name} = global i64 -1")
+            handle_var_v = f"%ffi_h_{self.new_tmp()[1:]}"
+            pending.append(f"  {handle_var_v} = load i64, i64* {slot_name}")
+
+            # Intern the symbol name string constant
+            sym_lbl, sym_len = self.intern_str(node.symbol_name)
+            sym_ptr_t = f"%ffi_sp_{self.new_tmp()[1:]}"
+            pending.append(f"  {sym_ptr_t} = getelementptr [{sym_len} x i8], [{sym_len} x i8]* {sym_lbl}, i64 0, i64 0")
+
+            # Get raw fn pointer as i64 via ffi_sym
+            raw_fp = f"%ffi_raw_{self.new_tmp()[1:]}"
+            pending.append(f"  {raw_fp} = call i64 @ffi_sym(i64 {handle_var_v}, i8* {sym_ptr_t})")
+
+            # Null check — if symbol not resolved, skip the call and return zero/null
+            is_null = f"%ffi_null_{self.new_tmp()[1:]}"
+            pending.append(f"  {is_null} = icmp eq i64 {raw_fp}, 0")
+
         pending.append(f"  br i1 {is_null}, label %{bad_lbl}, label %{ok_lbl}")
         pending.append(f"{bad_lbl}:")
         if ret_ir == "void":
@@ -4089,13 +4638,22 @@ class CodeGen:
             pending.append(f"  ret {ret_ir} 0.0")
         elif ret_ir in ("i8*", "%Box*") or ret_ir.endswith("*"):
             pending.append(f"  ret {ret_ir} null")
+        # A bare struct return type (pass/return BY VALUE) is an aggregate —
+        # "0" isn't a valid literal for it, "zeroinitializer" is.
+        elif ret_ir.startswith("%struct_"):
+            pending.append(f"  ret {ret_ir} zeroinitializer")
         else:
             pending.append(f"  ret {ret_ir} 0")
         pending.append(f"{ok_lbl}:")
 
-        # Bitcast i64 → fn ptr type
+        # Get a correctly-typed function pointer to call through — a bitcast
+        # from the ptr-typed variable's own i8* value for a ptr bind, or the
+        # existing inttoptr-from-i64 path for a dlsym'd address.
         fp_cast = f"%ffi_fp_{self.new_tmp()[1:]}"
-        pending.append(f"  {fp_cast} = inttoptr i64 {raw_fp} to {fn_ptr_t}")
+        if node.is_ptr_bind:
+            pending.append(f"  {fp_cast} = bitcast i8* {raw_fp} to {fn_ptr_t}")
+        else:
+            pending.append(f"  {fp_cast} = inttoptr i64 {raw_fp} to {fn_ptr_t}")
 
         # Call the foreign function
         args_str = ", ".join(f"{pt} %p{i}" for i, pt in enumerate(param_ir_types))
@@ -4465,6 +5023,22 @@ class CodeGen:
         # Extract the name if it's an ast.Var object
         obj_name = obj.name if hasattr(obj, 'name') else str(obj)
 
+        # syntax: DATA TYPES > STRUCT — checked before self.instances (the
+        # class equivalent, see struct_instances' own comment for why
+        # they're separate dicts). No mutability-declaration concept for
+        # struct fields at all — a raw C struct has no such thing, every
+        # field is always readable/writable, same as in C.
+        if obj_name in self.struct_instances:
+            struct_name = self.struct_instances[obj_name]
+            idx, ir_t = self.struct_field_index(struct_name, field_name)
+            struct_t = self.struct_ir_type(struct_name)
+            ptr_str, _ = self.get_var_ptr(obj_name)
+            inst_ptr = self.new_tmp(); fptr = self.new_tmp(); val = self.new_tmp()
+            self.emit(f"  {inst_ptr} = load {struct_t}*, {struct_t}** {ptr_str}")
+            self.emit(f"  {fptr} = getelementptr {struct_t}, {struct_t}* {inst_ptr}, i32 0, i32 {idx}")
+            self.emit(f"  {val} = load {ir_t}, {ir_t}* {fptr}")
+            return val, ir_t
+
         # Module-qualified variable access (e.g. `xeon math_tools` / `import
         # math_tools` then `math_tools.pi` -> the global `math_tools_pi`).
         # Resolves aliases too (e.g. `import math_tools as mt` -> `mt.pi`).
@@ -4604,8 +5178,8 @@ class CodeGen:
                 node.args = self._resolve_call_args(
                     node.name, fn_def.params[1:], getattr(fn_def, "defaults", {}), node.args)
                 self._check_arg_count(node.name, fn_def.params[1:], node.args)
-                param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_def.params]
-                ret_ir = self.rubi_type_to_ir(fn_def.ret_type) if fn_def.ret_type else "i64"
+                param_types = [self._ffi_type_to_ir(pt) for _, pt in fn_def.params]
+                ret_ir = self._ffi_type_to_ir(fn_def.ret_type) if fn_def.ret_type else "i64"
                 args_ir = [f"{struct_t}* {self_val}"]
                 for i, a in enumerate(node.args):
                     av, at = self.emit_expr(a)
@@ -4778,8 +5352,8 @@ class CodeGen:
             fn_name = func_call_node.name if isinstance(func_call_node, FnCall) else str(func_call_node)
             call_args = func_call_node.args if isinstance(func_call_node, FnCall) else []
             fn_def = self.functions.get(fn_name)
-            param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_def.params] if (fn_def and fn_def.params) else []
-            ret_ir = self.rubi_type_to_ir(fn_def.ret_type) if (fn_def and fn_def.ret_type) else "i64"
+            param_types = [self._ffi_type_to_ir(pt) for _, pt in fn_def.params] if (fn_def and fn_def.params) else []
+            ret_ir = self._ffi_type_to_ir(fn_def.ret_type) if (fn_def and fn_def.ret_type) else "i64"
             tramp = f"_tramp_{fn_name}"
 
             # Marshal arguments (if any) into a heap-allocated struct for the trampoline
@@ -4869,17 +5443,20 @@ class CodeGen:
             node.args = self._resolve_call_args(
                 node.name, fn_obj.params or [], getattr(fn_obj, "defaults", {}), node.args)
             self._check_arg_count(node.name, fn_obj.params or [], node.args)
-            # FFI-bound functions (`fn lib symbol(...) as name`) now target
-            # only another Rubidium-compiled shared library (`FFI("lib.so")`
-            # built by this same compiler with `-s`) — both sides share the
-            # exact same %Box*/RList/RDict layout, so a call here is
-            # marshaled exactly like an ordinary Rubidium function call, no
-            # FFI-specific type mapping needed. The only FFI-specific bit
-            # left is the return-type default: no `-> ret` means void (a
-            # real C-style function with no return slot), where an ordinary
-            # internal function without one defaults to i64.
+            # FFI-bound functions (`fn lib symbol(...) as name`) can target
+            # either another Rubidium-compiled shared library (plain
+            # Rubidium types in the signature, sharing the same %Box* layout
+            # as an ordinary call) OR a genuine foreign C library (LIB types
+            # in the signature — see DATA TYPES > LIB and the FFI section).
+            # _ffi_type_to_ir handles both: identical to rubi_type_to_ir for
+            # a real Rubidium type, and the correct raw C width for a LIB
+            # one — so it's always the right mapping here, not just for LIB
+            # types. The only OTHER FFI-specific bit is the return-type
+            # default: no `-> ret` means void (a real C-style function with
+            # no return slot), where an ordinary internal function without
+            # one defaults to i64.
             is_ffi = target_name in self.ffi_functions
-            param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_obj.params] if fn_obj.params else []
+            param_types = [self._ffi_type_to_ir(pt) for _, pt in fn_obj.params] if fn_obj.params else []
             args_ir = []
             for i, a in enumerate(node.args):
                 v, t = self.emit_expr(a)
@@ -5081,6 +5658,110 @@ class CodeGen:
             tid_v = self.coerce(tid_v, tid_t, "i64")
             self.emit(f"  call void @_thread_kill(i64 {tid_v})")
             return "0", "i64"
+
+        # 0a2. `cast`/`retrieve` — see CONVERSION. Both directions go
+        # through the exact same coerce() machinery underneath (coerce()
+        # doesn't care which "direction" a conversion is conceptually in) —
+        # cast.X(value) and retrieve.X(value) differ only in which name
+        # reads more naturally at the call site, not in what they actually
+        # do. Either accepts a LIB target (cast.int(x)) or a real Rubidium
+        # target (retrieve.Any(ptr)) — the CONVERSION section's cast=to-lib/
+        # retrieve=from-lib split is a naming convention for readability,
+        # not an enforced restriction.
+        if obj_name == "cast" and node.method == "list" and len(node.args) == 2:
+            # cast.list(list, elem_type) — flatten a Rubidium list into a
+            # raw contiguous C array (const void* + count territory, e.g.
+            # glBufferData's `data`). Same method name as the 1-arg generic
+            # cast.list(x) below (a plain Any/box relabel) — disambiguated
+            # purely by argument count, since the two operations have
+            # nothing else in common. See CONVERSION.
+            list_v, list_t = self.emit_expr(node.args[0])
+            list_b = self.coerce_to_box(list_v, list_t)
+            elem_name = self._extract_type_arg_name(node.args[1])
+            elem_ir = self._ffi_type_to_ir(elem_name) if elem_name else None
+            kind = self._BUFFER_ELEM_KIND.get(elem_ir)
+            if kind is None:
+                raise RubidiumTypeError(
+                    f"cast.list(list, elem_type): unsupported element type {elem_name!r} — "
+                    f"only i32/i64/f32/f64 (or the equivalent LIB types int/long/float/double) are supported."
+                )
+            buf_tmp = self.new_tmp()
+            self.emit(f"  {buf_tmp} = call i8* @list_to_flat_buffer(%Box* {list_b}, i32 {kind})")
+            # BUG-3: track like any other freshly malloc'd i8* result, so
+            # it's freed automatically at block exit unless bound somewhere
+            # longer-lived (e.g. passed straight into an FFI call).
+            return self._track_temp(buf_tmp, "i8*"), "i8*"
+
+        if obj_name == "retrieve" and node.method == "list" and len(node.args) == 3:
+            # retrieve.list(ptr, elem_type, count) — read a raw C array
+            # (e.g. what a C function wrote into an out-parameter buffer)
+            # back into a real Rubidium list. Same method name as the 1-arg
+            # generic retrieve.list(x) below (a plain Any/box relabel) —
+            # disambiguated purely by argument count. See CONVERSION.
+            ptr_v, ptr_t = self.emit_expr(node.args[0])
+            ptr_v = self.coerce(ptr_v, ptr_t, "i8*")
+            elem_name = self._extract_type_arg_name(node.args[1])
+            elem_ir = self._ffi_type_to_ir(elem_name) if elem_name else None
+            kind = self._BUFFER_ELEM_KIND.get(elem_ir)
+            if kind is None:
+                raise RubidiumTypeError(
+                    f"retrieve.list: unsupported element type {elem_name!r} — "
+                    f"only i32/i64/f32/f64 (or the equivalent LIB types int/long/float/double) are supported."
+                )
+            count_v, count_t = self.emit_expr(node.args[2])
+            count_v = self.coerce(count_v, count_t, "i32")
+            tmp = self.new_tmp()
+            self.emit(f"  {tmp} = call %Box* @flat_buffer_to_list(i8* {ptr_v}, i32 {kind}, i32 {count_v})")
+            return tmp, "%Box*"
+
+        # A "list" call that fell through both specific branches above with
+        # an arg count that matches NEITHER (cast.list wants 1 or 2, retrieve
+        # .list wants 1 or 3) would otherwise silently mis-dispatch into the
+        # generic 1-arg branch below, quietly discarding the extra
+        # arguments — a clear error is much better than that.
+        if node.method == "list":
+            if obj_name == "cast" and len(node.args) not in (1, 2):
+                raise RubidiumTypeError(
+                    f"cast.list(...) takes 1 argument (relabel as a list) or 2 "
+                    f"(cast.list(list, elem_type), flatten to a raw C array) — got {len(node.args)}."
+                )
+            if obj_name == "retrieve" and len(node.args) not in (1, 3):
+                raise RubidiumTypeError(
+                    f"retrieve.list(...) takes 1 argument (relabel as a list) or 3 "
+                    f"(retrieve.list(ptr, elem_type, count), read back a raw C array) — got {len(node.args)}."
+                )
+
+        if obj_name in ("cast", "retrieve"):
+            target_ir = self._cast_target_ir(node.method)
+            if target_ir is None:
+                raise RubidiumNameError(
+                    f"Unknown {obj_name} target: {obj_name}.{node.method}(...) — "
+                    f"not a recognized LIB type or Rubidium type."
+                )
+            if not node.args:
+                raise RubidiumTypeError(f"{obj_name}.{node.method}(...) needs exactly one argument")
+            v, t = self.emit_expr(node.args[0])
+            # syntax: CONVERSION — a LIB numeric type whose IR representation
+            # already exactly matches the source value's own Rubidium type
+            # needs no conversion at all: that value is already directly
+            # usable wherever the LIB type is expected (an FFI signature
+            # crosses it as-is). cast.X()/retrieve.X() no longer allows a
+            # no-op pass-through for these — it would just be relabeling an
+            # already-correct value. Pointer LIB types (void*/char*/ptr) are
+            # exempt: even when the IR coincides with the source's (str and
+            # char* are both i8*), the cast is doing real semantic work —
+            # marking the value as a raw address vs. text — not a width
+            # no-op, so it stays meaningful even when "nothing changes".
+            if (node.method in self._CAST_METHOD_TO_LIB_TYPE
+                    and target_ir != "i8*" and t == target_ir):
+                raise RubidiumTypeError(
+                    f"{obj_name}.{node.method}(...) is redundant — this value is "
+                    f"already {target_ir}-shaped, identical to LIB type "
+                    f"'{self._CAST_METHOD_TO_LIB_TYPE[node.method]}'. No conversion "
+                    f"needed; use the value directly in the FFI call."
+                )
+            result = self.coerce(v, t, target_ir)
+            return result, target_ir
 
         # 0b. `net` module — LAN discovery/messaging (see syntax's NET section).
         # process()/listen() only make sense as the body of a background
@@ -5607,13 +6288,13 @@ class CodeGen:
                 for i, arg_node in enumerate(node.args):
                     v, t = self.emit_expr(arg_node)
                     if i + 1 < len(fn.params):
-                        expected_t = self.rubi_type_to_ir(fn.params[i + 1][1])
+                        expected_t = self._ffi_type_to_ir(fn.params[i + 1][1])
                         v = self.coerce(v, t, expected_t)
                         args_ir.append(f"{expected_t} {v}")
                     else:
                         args_ir.append(f"{t} {v}")
 
-                ret_t = self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
+                ret_t = self._ffi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
                 tmp = self.new_tmp()
                 if ret_t == "void":
                     self.emit(f"  call void @{mangled}({', '.join(args_ir)})")
@@ -5649,7 +6330,11 @@ class CodeGen:
                 # %Box*-typed value such as a `str` bound to a for-loop variable
                 # was passed straight into an i8* parameter, arriving empty at
                 # the callee (rendered as nothing).
-                param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_obj.params] if fn_obj.params else []
+                # _ffi_type_to_ir (not plain rubi_type_to_ir) so a namespaced
+                # call into an imported file's own `fn callback`/LIB-typed
+                # function gets the correct raw C width too — a strict
+                # superset of rubi_type_to_ir for every ordinary type.
+                param_types = [self._ffi_type_to_ir(pt) for _, pt in fn_obj.params] if fn_obj.params else []
                 args_ir = []
                 for i, a in enumerate(node.args):
                     v, t = self.emit_expr(a)
@@ -5658,7 +6343,7 @@ class CodeGen:
                     args_ir.append(f"{t} {v}")
                 tmp = self.new_tmp()
                 fn_ret = fn_obj.ret_type
-                ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
+                ret_ir = self._ffi_type_to_ir(fn_ret) if fn_ret else "i64"
                 # BUGFIX (bugs.log #1): call the real emitted symbol (fn_obj.name).
                 self.emit(f"  {tmp} = call {ret_ir} @{fn_obj.name}({', '.join(args_ir)})")
                 self._emit_error_propagation_check()
@@ -5696,8 +6381,9 @@ class CodeGen:
                         getattr(fn_obj, "defaults", {}), node.args)
                     self._check_arg_count(f"{ns_name}.{attr_name}.{node.method}", fn_obj.params or [], node.args)
                     # OPEN-12: coerce args to declared param types (see the
-                    # module-function path above — same fix).
-                    param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_obj.params] if fn_obj.params else []
+                    # module-function path above — same fix). _ffi_type_to_ir
+                    # for the same reason noted there.
+                    param_types = [self._ffi_type_to_ir(pt) for _, pt in fn_obj.params] if fn_obj.params else []
                     args_ir = []
                     for i, a in enumerate(node.args):
                         v, t = self.emit_expr(a)
@@ -5706,7 +6392,7 @@ class CodeGen:
                         args_ir.append(f"{t} {v}")
                     tmp = self.new_tmp()
                     fn_ret = fn_obj.ret_type
-                    ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
+                    ret_ir = self._ffi_type_to_ir(fn_ret) if fn_ret else "i64"
                     self.emit(f"  {tmp} = call {ret_ir} @{fn_obj.name}({', '.join(args_ir)})")
                     self._emit_error_propagation_check()
                     return tmp, ret_ir
@@ -5838,11 +6524,11 @@ class CodeGen:
                     call_args = [f"{struct_t}* {casted}"]
                     for i, (v, t) in enumerate(arg_vals):
                         if i + 1 < len(mfn.params):
-                            expected_t = self.rubi_type_to_ir(mfn.params[i + 1][1])
+                            expected_t = self._ffi_type_to_ir(mfn.params[i + 1][1])
                             call_args.append(f"{expected_t} {self.coerce(v, t, expected_t)}")
                         else:
                             call_args.append(f"{t} {v}")
-                    ret_ir = self.rubi_type_to_ir(mfn.ret_type) if mfn.ret_type else "i64"
+                    ret_ir = self._ffi_type_to_ir(mfn.ret_type) if mfn.ret_type else "i64"
                     res = self.new_tmp()
                     self.emit(f"  {res} = call {ret_ir} @{mfn.name}({', '.join(call_args)})")
                     self._emit_error_propagation_check()
@@ -5907,7 +6593,7 @@ class CodeGen:
             tmp = self.new_tmp()
             fn_obj = self.functions[target_name]
             fn_ret = fn_obj.ret_type
-            ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
+            ret_ir = self._ffi_type_to_ir(fn_ret) if fn_ret else "i64"
             self.emit(f"  {tmp} = call {ret_ir} @{fn_obj.name}({', '.join(args_ir)})")
             self._emit_error_propagation_check()
             return tmp, ret_ir
@@ -6901,5 +7587,29 @@ class CodeGen:
                 self.emit(f"  {t2} = trunc i64 {tmp} to i1")
                 return t2
             return tmp
+
+        # ---- i8*/void* (LIB pointer) -> a specifically-named pointer type ----
+        # syntax: DATA TYPES > STRUCT — `let mode: GLFWvidmode = ptr_expr`,
+        # the "view an existing pointer as a struct" form: ptr_expr is
+        # i8*-shaped (void*/ptr/char*, or a struct pointer of a DIFFERENT
+        # name being reinterpreted), the declared type needs %struct_X*. No
+        # copy — same address, just a differently-typed handle on it. Also
+        # covers `fn ptr raw(...)`-adjacent cases where a raw i8* needs to
+        # become some other named pointer type generally.
+        if from_t == "i8*" and to_t != "i8*" and to_t.endswith("*"):
+            self.emit(f"  {tmp} = bitcast i8* {val} to {to_t}"); return tmp
+        if from_t.endswith("*") and from_t != "i8*" and to_t.endswith("*") and to_t != "%Box*" and from_t != to_t:
+            self.emit(f"  {tmp} = bitcast {from_t} {val} to {to_t}"); return tmp
+
+        # ---- %struct_X* -> %struct_X (pass/return a struct BY VALUE) ----
+        # syntax: DATA TYPES > STRUCT — a struct variable's storage is
+        # always a pointer to its data (owned = malloc'd, view = someone
+        # else's address — see emit_struct_init/emit_struct_view). A bare
+        # struct type name in a function signature (no trailing '*') now
+        # means "pass/return the actual bytes", so crossing from the
+        # variable's own pointer-shaped value to that bare type means: load
+        # the struct's current contents through the pointer.
+        if from_t == f"{to_t}*" and to_t.startswith("%struct_"):
+            self.emit(f"  {tmp} = load {to_t}, {to_t}* {val}"); return tmp
 
         return val

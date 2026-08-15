@@ -34,6 +34,20 @@ def _closest_name(word: str, candidates, max_dist: int = 1) -> str | None:
 KNOWN_MODULES = {
     'random', 'math', 'time', 'json', 'os', 'FFI', 'net', 'crypto', 'io',
     'keyboard',
+    # cast/retrieve (syntax's CONVERSION section) — always available, no
+    # `use` needed, same as they are in the real compiler (codegen.py's
+    # Use node is a no-op there too; `use X` is a documentation convention,
+    # not an enforced gate).
+    'cast', 'retrieve',
+}
+
+# Mirrors codegen.py's CodeGen._FFI_FORBIDDEN_TYPES — kept as a plain
+# module-level copy since debug.py's Analyzer never touches CodeGen.
+FFI_FORBIDDEN_TYPES = {
+    "dict": "dict can't cross an FFI boundary — it has no C-compatible layout and no conversion route. Keep dicts on the Rubidium side of the call.",
+    "dict+": "dict+ can't cross an FFI boundary — it has no C-compatible layout and no conversion route. Keep dicts on the Rubidium side of the call.",
+    "index": "index can't cross an FFI boundary — it has no C-compatible layout and no conversion route. Keep it on the Rubidium side of the call.",
+    "list": "list can't cross an FFI boundary directly — flatten it first with cast.list(list, elem_type), and read a written buffer back with retrieve.list(ptr, elem_type, count).",
 }
 
 BUILTIN_FNS = {
@@ -54,6 +68,23 @@ NUMERIC_TYPES = {
     'i32', 'i64', 'i128', 'i256', 'i512', 'i1024', 'i2048',
     'f32', 'f64', 'f128', 'f256', 'f512', 'f1024', 'f2048',
 }
+
+# LIB types (syntax's DATA TYPES > LIB section) — mirrors codegen.py's
+# LIB_TYPE_TO_IR keys, kept in sync so this analyzer accepts the same
+# argument types the real compiler does instead of falsely blocking valid
+# FFI-binding/callback calls (e.g. `create_window(800, ...)` where the
+# param is declared `int` but the literal 800 infers as i32).
+LIB_INT_TYPES = {
+    'char', 'signed char', 'unsigned char',
+    'short', 'unsigned short', 'int', 'unsigned int',
+    'long', 'unsigned long', 'long long', 'unsigned long long',
+    'int8_t', 'uint8_t', 'int16_t', 'uint16_t',
+    'int32_t', 'uint32_t', 'int64_t', 'uint64_t',
+    'int128_t', 'uint128_t',
+    'size_t', 'ptrdiff_t', 'intptr_t', 'uintptr_t',
+}
+LIB_FLOAT_TYPES = {'float', 'double', 'long double'}
+LIB_NUMERIC_TYPES = LIB_INT_TYPES | LIB_FLOAT_TYPES
 
 HEAP_TYPES = {'list', 'index', 'dict', 'str'}
 
@@ -140,6 +171,13 @@ class Analyzer:
         self.issues: list = []
         self.functions: dict  = {}
         self.classes:   dict  = {}
+        # syntax: DATA TYPES > STRUCT — name -> {field_name} set. Simpler
+        # than self.classes: no methods, no mutability tracking (every
+        # struct field is always writable, same as a raw C struct), just
+        # enough to recognize StructName() as a valid instantiation and
+        # instance.field as valid access instead of false-positiving as
+        # "unknown function"/"not an instance".
+        self.structs:   dict  = {}
         self.namespaces: set  = set()
         self.imports:    set  = set()
         # RIG report: name of the class whose method body is currently
@@ -377,6 +415,15 @@ class Analyzer:
             return True
         if expected in NUMERIC_TYPES and received in NUMERIC_TYPES:
             return True
+        # LIB numeric types (see DATA TYPES > LIB) accept the same free
+        # mixing NUMERIC_TYPES does above — codegen's coerce() always
+        # widens/narrows between any two int-or-float IR types, LIB or
+        # Rubidium, the same way. A LIB-typed binding param also happily
+        # accepts a plain Rubidium numeric type and vice versa (an FFI
+        # binding's own signature is exactly where the two meet).
+        if (expected in NUMERIC_TYPES or expected in LIB_NUMERIC_TYPES) \
+                and (received in NUMERIC_TYPES or received in LIB_NUMERIC_TYPES):
+            return True
         # BUGFIX (bugs.log #3): str+ is spec'd as "the same as str but it
         # uses 3 \" on each side and can use more than 1 line" — it's not a
         # distinct data type, just a literal-syntax variant. A `let x: str+`
@@ -385,6 +432,15 @@ class Analyzer:
         # str and str+ as compatible in both directions instead of flagging
         # a false-positive Type Error that would block valid code.
         if {expected, received} == {'str', 'str+'}:
+            return True
+        # char* and str share the exact same i8* representation (see
+        # CONVERSION) — interchangeable in either direction, same reasoning
+        # as str/str+ above.
+        if {expected, received} <= {'str', 'str+', 'char*'}:
+            return True
+        # void* is a fully generic opaque pointer (see DATA TYPES > LIB) —
+        # accepts/is accepted by any other pointer-shaped value.
+        if 'void*' in (expected, received) and {expected, received} & {'void*', 'char*', 'str', 'str+'}:
             return True
         return False
 
@@ -399,6 +455,9 @@ class Analyzer:
                         'used':     False,
                         'line':     self._ln('fn', node.name),
                     }
+            elif isinstance(node, ast.StructDef):
+                if node.name not in self.structs:
+                    self.structs[node.name] = {fname for fname, _ in node.fields}
             elif isinstance(node, ast.ClassDef):
                 if node.name not in self.classes:
                     fields = {}
@@ -436,6 +495,20 @@ class Analyzer:
                 # alias) was never registered, so every legitimate call to
                 # a bound FFI function was falsely reported as unknown.
                 callable_name = node.alias or node.symbol_name
+                # Mirror codegen.py's _FFI_FORBIDDEN_TYPES — dict/dict+/index
+                # have no C-compatible layout and no conversion route, and
+                # list must cross only via cast.list/retrieve.list, never
+                # as a direct binding parameter/return type. Catching this
+                # here means the static analyzer flags it before a real
+                # compile even runs.
+                ffi_line = self._ln('ffi', callable_name) or None
+                for pn, pt in (node.params or []):
+                    if pt in FFI_FORBIDDEN_TYPES:
+                        self._emit('ERROR', ffi_line, 'FFI Boundary Error',
+                                   f"FFI binding '{callable_name}', parameter '{pn}': {FFI_FORBIDDEN_TYPES[pt]}")
+                if node.ret_type in FFI_FORBIDDEN_TYPES:
+                    self._emit('ERROR', ffi_line, 'FFI Boundary Error',
+                               f"FFI binding '{callable_name}', return type: {FFI_FORBIDDEN_TYPES[node.ret_type]}")
                 if callable_name and callable_name not in self.functions:
                     self.functions[callable_name] = {
                         'params':   node.params,
@@ -1637,8 +1710,9 @@ class Analyzer:
 
         if name not in self.functions and name not in BUILTIN_FNS \
                 and name not in self.classes \
+                and name not in self.structs \
                 and name not in self.namespaces:
-            all_fns = list(self.functions) + list(BUILTIN_FNS) + list(self.classes)
+            all_fns = list(self.functions) + list(BUILTIN_FNS) + list(self.classes) + list(self.structs)
             suggestion = _closest_name(name, all_fns)
             msg = f"Unknown function: {name}()"
             if suggestion:

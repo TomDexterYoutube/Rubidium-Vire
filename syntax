@@ -150,7 +150,12 @@ let f: Any  = "I can be anything!"
 #   long double — extended precision (implementation-defined)
 #
 # - pointer and special types
-#   void*       — pointer to unknown type
+#   void*       — pointer to unknown, opaque DATA
+#   ptr         — a raw, already-resolved FUNCTION-pointer-shaped address
+#                 (e.g. from glXGetProcAddress) — see FFI's `fn ptr raw(...)`.
+#                 Same representation as void*, kept as its own name so a
+#                 declaration reads as "this is meant to be called through",
+#                 not "this is opaque data".
 #   NULL        — null pointer constant
 #   _Bool / bool — boolean type (0 or 1)
 #
@@ -158,9 +163,76 @@ let f: Any  = "I can be anything!"
 # - Use unsigned variants for non-negative values where overflow behavior matters.
 # - For fixed-width guarantees across platforms, prefer stdint.h types (int32_t, etc.).
 # - Interfacing with C libraries should follow the platform ABI and sizes.
+#
+# WHICH LIB TYPES NEED NO CONVERSION: these are BIT-FOR-BIT the same
+# representation as an existing Rubidium type, so a Rubidium value of that
+# type is already directly usable as that LIB type in an FFI signature —
+# no cast.X()/retrieve.X() needed or offered (see CONVERSION's "no-op
+# casts are rejected"):
+#   int, unsigned int, int32_t, uint32_t         <-> i32
+#   long, unsigned long, long long,
+#     unsigned long long, int64_t, uint64_t,
+#     size_t, ptrdiff_t, intptr_t, uintptr_t     <-> i64
+#   int128_t, uint128_t                          <-> i128
+#   float                                        <-> f32
+#   double                                       <-> f64
+# Everything else (char/short and their unsigned/signed variants, long
+# double, void*/char*/ptr) has no matching native Rubidium type at that
+# exact width/shape and genuinely needs cast.X()/retrieve.X() to cross.
 
 # You can only do Vire code in Rubidium types — see CONVERSION below for
 # how to move values between Vire and lib types.
+
+# -----------------------------------------
+# STRUCT
+# -----------------------------------------
+
+# Some C APIs hand you (or want from you) a fixed-layout block of memory
+# with named fields at exact byte positions — GLFWvidmode, a vertex struct
+# you define yourself, and so on. `struct` describes that shape: a name and
+# a LIB type per field, in declaration order. No methods, no `mut` on
+# fields — every field is always readable/writable, the same as a raw C
+# struct. Not the same thing as `class`: a class instance is a Rubidium
+# object with Rubidium's own memory bookkeeping; a struct is raw memory
+# laid out exactly the way C would lay it out, nothing more.
+
+struct GLFWvidmode {
+    width: int
+    height: int
+    redBits: int
+    greenBits: int
+    blueBits: int
+    refreshRate: int
+}
+
+# Two ways to get an instance — both act like a stripped-down class (name
+# the type, read/write `.field`), not like a list:
+
+# 1. Fresh, zeroed, owned — same call syntax as instantiating a class:
+
+let mut mode = GLFWvidmode()
+mode.width = 1920
+mode.height = 1080
+
+# 2. A VIEW over a pointer a C function already gave you — no allocation,
+# no copy, just a differently-typed handle on the exact same address. Give
+# the variable its type explicitly; the value is whatever pointer you're
+# viewing:
+
+let glfw = FFI("libglfw.so")
+fn glfw glfwGetVideoMode(monitor: void*) -> void* as get_video_mode
+
+let ptr = get_video_mode(primary_monitor)
+let live_mode: GLFWvidmode = ptr
+
+print(live_mode.width)    # reads directly out of GLFW's own memory
+
+# Passing a struct's address to a raw C function needs no extra syntax —
+# an owned struct variable already IS its address, same as a class
+# instance, so it binds straight into a `void*` parameter:
+
+fn glfw glfwSetGamma(monitor: void*, gamma: float) as set_gamma
+# some_fn(mode) where some_fn's param is void* — just works
 
 
 # =========================================
@@ -1597,33 +1669,93 @@ os(1).drop()
 # CONVERSION
 # =========================================
 
-# Simple conversion syntax between Rubidium (Vire) types and C/lib types.
-# The direction decides which function to use:
-#   cast.<target_type>(value)    — Rubidium type    -> C/lib type
-#   retrive.<target_type>(value) — C/lib type        -> Rubidium type
-# Examples:
+# Conversion between Rubidium (Vire) types and LIB (C) types. cast.X(value)
+# and retrieve.X(value) are the same underlying operation — X is the
+# TARGET type either way — named differently only so the direction reads
+# naturally at the call site: cast when you're headed OUT toward a LIB
+# type, retrieve when you're headed back IN toward a Rubidium type.
 
-# Convert Rubidium integer to C int (lib alias):
-let a: i32 = 42
-let b: c_type = cast.int(a)
+# X is a method name, so it can't be spelled exactly like a multi-word LIB
+# type ("unsigned int") or one with a literal '*' in it ("char*") — those
+# get their own single-word name below instead. Every other LIB type
+# keeps its own name unchanged (cast.int, cast.long, cast.double, ...).
+#
+#   char* -> cstr        void* -> voidptr     ptr -> ptr (unchanged)
+#   unsigned char  -> uchar     signed char -> schar
+#   unsigned short -> ushort    unsigned int -> uint
+#   unsigned long  -> ulong     long long -> longlong
+#   unsigned long long -> ulonglong    long double -> longdouble
+#   int8_t/uint8_t   -> int8/uint8      int16_t/uint16_t -> int16/uint16
+#   int32_t/uint32_t -> int32/uint32    int64_t/uint64_t -> int64/uint64
+#   int128_t/uint128_t -> int128/uint128
+#   size_t/ptrdiff_t/intptr_t/uintptr_t -> unchanged
 
-# Convert C pointer (void*) back to Rubidium Any (opaque) — the reverse
-# direction, so retrive is used instead of cast:
-let ptr: void* = Null
-let any_val: Any = retrive.Any(ptr)
+# NO-OP CASTS ARE REJECTED: a LIB numeric type whose representation is
+# already IDENTICAL to the source value's own Rubidium type needs no
+# conversion at all — that value is already directly usable wherever the
+# LIB type is expected (see DATA TYPES > LIB / doesn't-need-conversion
+# below). cast.X()/retrieve.X() is a compile error in that case, not a
+# silent pass-through:
+#
+#   let a: i32 = 42
+#   let b = cast.int(a)     # Type Error — a is already int-shaped (i32);
+#                            # pass `a` straight into the FFI call instead
+#
+# A genuine width change is still a real conversion and works normally:
+let a: i64 = 5000000000
+let b = cast.int(a)   # narrows i64 -> int (i32), clamps to range
 
-# Convert between numeric sizes explicitly:
+# LIB pointer -> Rubidium Any (retrieve, since it's headed back in):
+let raw_ptr = cast.voidptr(Null)
+let any_val: Any = retrieve.Any(raw_ptr)
+
+# Narrowing between numeric sizes — same overflow clamping as `as`:
 let x: i64 = 10000000000
-let y: i32 = cast.i32(x)   # narrows, may truncate
+let y = cast.i32(x)   # narrows, clamps to i32's range
 
-# Convert Rubidium str to C char* (for FFI):
+# Rubidium str <-> LIB char* — cstr and str already share the exact same
+# representation, so this direction never actually loses/reshapes data:
 let s: str = "hello"
-let cstr: c_type = cast.char*(s)
+let cs = cast.cstr(s)
+let back: str = retrieve.str(cs)
+
+# -----------------------------------------
+# BUFFERS
+# -----------------------------------------
+
+# Rubidium's own list/dict/etc have no raw C layout — cast.list(list,
+# elem_type) is the one exception, flattening a list into a raw contiguous
+# C array (a `const void* data` parameter, e.g. glBufferData). Same method
+# name as the 1-arg cast.list(x) above (CONVERSION's ordinary Any/box
+# relabel) — the 2-argument form is a completely different operation
+# (actually walks and flattens the list), disambiguated purely by how many
+# arguments you pass. elem_type is a bare type keyword (i32/f32/int/
+# float/...), not a string; only i32/i64/f32/f64-width int/float types are
+# supported (the widths a real C ABI actually uses) — the equivalent LIB
+# types (int/long/float/double, or the matching intN_t) work exactly the
+# same:
+
+let verts: list: f32 = [0.0, 1.0, 0.0, -1.0, -1.0, 0.0]
+let buf = cast.list(verts, f32)
+
+# retrieve.list(ptr, elem_type, count) is the reverse — reads `count`
+# elements of elem_type width back out of a raw buffer into a real
+# Rubidium list (same "1 arg = relabel, 3 args = real work" disambiguation
+# as cast.list above). This is also how you read an out-parameter a C
+# function wrote into (glGenBuffers(n, &buffers)-style APIs): pass it a
+# placeholder list of the right length so cast.list() gives you a buffer to
+# hand the C function, then retrieve.list() the same pointer afterward to
+# see what it wrote:
+
+let mut placeholder: list: i32 = [0, 0, 0]
+let out_buf = cast.list(placeholder, i32)
+# some_c_fn(out_buf, 3)   -- writes 3 ints into out_buf
+let results: list = retrieve.list(out_buf, i32, 3)
 
 # Notes:
-# - cast.target(value) converts a Rubidium value INTO a C/lib type.
-# - retrive.target(value) converts a C/lib value BACK INTO a Rubidium type.
-# - Conversions that may lose precision must be explicit.
+# - cast.X(value) / retrieve.X(value) are the same operation; the
+#   direction in the name is a readability convention, not enforced.
+# - Conversions that may lose precision must be explicit, same as `as`.
 # - Null can be cast to any pointer type.
 
 
@@ -1631,12 +1763,81 @@ let cstr: c_type = cast.char*(s)
 # FFI — FOREIGN FUNCTION INTERFACE
 # =========================================
 
+# A binding's parameter/return types can be Rubidium types OR LIB types,
+# mixed freely in the same signature — which one you use depends on what's
+# actually on the other side of FFI("..."):
+
+# Loaded library is ITSELF Rubidium-compiled (built by this same compiler
+# with `-s`) — both sides share the exact same %Box* layout, so most real
+# Rubidium types cross directly, no conversion:
+
 let lib = FFI("lib.so")
 
+fn lib lib_fn(var: i32, var2: str) as fnut
 
-fn lib lib_fn(var: i32, var2: dict+) as fnut
+fnut(1, "hello")
 
-fnut(1, my_dictplus)
+# dict/dict+/index are the exception — they can NEVER cross an FFI
+# boundary, not even to another Rubidium-compiled .so. There's no way for
+# the compiler to tell at compile time whether the other side of
+# FFI("...") really is a Rubidium binary or a genuine foreign C library
+# that has no idea what a %Box* is, so these are rejected outright:
+#
+#   fn lib lib_fn(var2: dict+) as fnut   # Type Error — always, no exceptions
+#
+# list is similar but has a real conversion route — see BUFFERS above —
+# so it's rejected as a DIRECT binding parameter/return type but must
+# instead be flattened first with cast.list(list, elem_type)/
+# retrieve.list(ptr, elem_type, count):
+#
+#   fn lib lib_fn(var2: list) as fnut    # Type Error
+#   let buf = cast.list(my_list, i32)
+#   fn lib lib_fn(var2: void*) as fnut   # fine — buf is what actually crosses
+
+# Loaded library is a genuine foreign C library — its functions only know
+# about LIB types (see DATA TYPES > LIB), so the binding is written in
+# those instead:
+
+let glfw = FFI("libglfw.so")
+
+fn glfw glfwInit() -> int as glfw_init
+fn glfw glfwCreateWindow(width: int, height: int, title: char*, monitor: void*, share: void*) -> void* as create_window
+fn glfw glfwGetTime() -> double as get_time
+
+fn main() {
+    glfw_init()
+    let win = create_window(800, 600, "Hello Vire", Null, Null)
+    let t = get_time()
+}
+
+# -----------------------------------------
+# BINDING AGAINST A RESOLVED ADDRESS
+# -----------------------------------------
+
+# `fn lib symbol(...) as alias` looks a name up in a loaded library (dlsym,
+# effectively) — fine for a function that's always exported under a fixed
+# name. Some APIs don't work that way: OpenGL past the oldest baseline
+# functions has to be fetched at RUNTIME, by asking the driver "where is
+# glGenBuffers right now" and getting back a raw address instead of
+# anything you could look up by name a second time.
+
+# Getting the address is an ordinary binding — it's just a function that
+# happens to return a `ptr`:
+
+fn glfw glXGetProcAddress(name: char*) -> ptr as get_proc_address
+
+# Store it, typed as `ptr`, then bind directly against THAT — `fn ptr
+# <variable>(...)` instead of `fn <lib> <symbol>(...)`. No name lookup at
+# all this time; the variable already IS the address to call through:
+
+let raw: ptr = get_proc_address("glGenBuffers")
+fn ptr raw(n: int, buffers: void*) as gen_buffers
+
+gen_buffers(1, out_buf)
+
+# `as alias` is required here (there's no symbol name to fall back to,
+# unlike the dlsym form). Everything else — parameter/return types,
+# calling it afterward — works exactly like any other binding.
 
 # -----------------------------------------
 # FFI FUNCTION RENAMING
@@ -1686,6 +1887,72 @@ import math_tools as mt
 
 mt.sin(1.0)
 mt.sqrt(25.0)
+
+# -----------------------------------------
+# FFI CALLBACKS
+# -----------------------------------------
+
+# Everything the FFI section above does is Vire being the one in charge —
+# you call a C function, it runs, it hands an answer back, done. A callback
+# flips that around: you're telling a C library "here's a piece of code —
+# don't run it now, hang onto it, and call it YOURSELF later, whenever
+# something happens." GLFW doesn't know when you're going to press a key.
+# So instead, you hand GLFW the address of a function ahead of time, and
+# GLFW calls it the instant a key is pressed — possibly seconds or minutes
+# from now, from code you don't control the timing of at all.
+
+# Why this needs its own keyword instead of just "get the address": an
+# ordinary Vire function is compiled expecting to be called BY OTHER VIRE
+# CODE, which quietly sets a few things up every time a function is
+# called — memory bookkeeping, and a way to report errors back up the
+# chain. If C just called your function's raw address directly, none of
+# that setup would happen. `fn callback` builds a small C-ABI "receptionist"
+# in front of your function that does Vire's setup first, then calls your
+# real code, every single time C calls in.
+
+# `fn callback` is just like a normal `fn` — the ONLY difference is the
+# word `callback` right after `fn`. `callback` is a reserved word, same as
+# `local`/`open`/`file`.
+
+# The parameter types here are NOT your choice — they have to match EXACTLY
+# what the C library's own documentation says it will pass to your
+# function, so this is one of the few places you'll usually reach for LIB
+# types rather than Rubidium ones (see DATA TYPES > LIB):
+
+fn callback my_key_handler(key: int, action: int) {
+    print(i"key pressed: {key}")
+}
+
+# Handing GLFW the callback: write the function's NAME, with no
+# parentheses and no arguments. Parentheses would CALL it right now, today,
+# once — which isn't what you want. Leaving them off means "here's the
+# function itself, hang onto it and call it yourself later." Everywhere
+# else in Vire, a bare function name with no call is an error — but for a
+# name declared with `fn callback`, it's how you hand it off. The
+# parameter it's handed into is just `void*` (or whatever LIB pointer type
+# the C function's own signature declares for it) — a function pointer is
+# a pointer at the ABI level, same as any other:
+
+fn glfw glfwSetKeyCallback(window: void*, cb: void*) as set_key_callback
+
+set_key_callback(win, my_key_handler)
+
+# From this point on, you don't call my_key_handler yourself at all — GLFW
+# does, on its own schedule, every time a key event happens. Nothing else
+# about writing the function's BODY is different from any other Vire
+# function — print(), global variables, cast()/retrieve(), everything
+# works normally inside it.
+
+# Rules:
+# - Use `fn callback` instead of plain `fn` ONLY for a function you're
+#   going to hand to a C library as an event handler. Every other function
+#   stays exactly as `fn` as always.
+# - The parameter types and return type must match what the C library will
+#   actually call your function with — the compiler cannot check this for
+#   you, the same way it can't check a regular FFI binding's signature.
+# - Write the function name with NO parentheses when handing it to a C
+#   library expecting a callback. With parentheses, it's an ordinary
+#   function call, right now, once.
 
 
 # =========================================

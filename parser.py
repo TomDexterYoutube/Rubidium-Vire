@@ -104,6 +104,75 @@ class Parser:
             return tok[1]
         return None
 
+    # LIB types (syntax's DATA TYPES > LIB section) that are two or more
+    # words in real C ("unsigned int", "long long", "long double", ...).
+    # "unsigned"/"signed" aren't their own lexer token (plain IDENT, so they
+    # stay usable as ordinary identifiers everywhere else) — recognized here
+    # by value instead, with a real backtrack (self.pos restored) if what
+    # follows isn't actually a base type, so `let unsigned = 5` still parses
+    # unsigned as a normal variable name.
+    _UNSIGNED_SIGNED_BASES = {"char", "short", "int", "long"}
+    _LONG_COMPOUNDS = {"long", "double"}  # "long long", "long double"
+
+    def match_type(self):
+        """Like match("TYPE"), but also recognizes LIB types that don't fit
+        in a single TYPE token: an "unsigned"/"signed" prefix, a "long long"/
+        "long double" compound, and a trailing '*' for a raw C pointer type
+        (void*, char*, ...). Returns the combined type name string (e.g.
+        "unsigned long long", "void*") or None if nothing matched at all."""
+        saved = self.pos
+        tok = self.peek()
+
+        prefix = None
+        if tok and tok[0] == "IDENT" and tok[1] in ("unsigned", "signed"):
+            nxt = self.tokens[self.pos + 1] if self.pos + 1 < len(self.tokens) else None
+            if nxt and nxt[0] == "TYPE" and nxt[1] in self._UNSIGNED_SIGNED_BASES:
+                prefix = tok[1]
+                self.advance()
+            else:
+                return None  # "unsigned"/"signed" not followed by a base type — not a type at all
+
+        base = self.match("TYPE")
+        if base is None:
+            self.pos = saved
+            return None
+
+        if base == "long":
+            nxt = self.peek()
+            if nxt and nxt[0] == "TYPE" and nxt[1] in self._LONG_COMPOUNDS:
+                self.advance()
+                base = f"long {nxt[1]}"
+
+        name = f"{prefix} {base}" if prefix else base
+
+        # Raw C pointer: a base type directly followed by '*' (void*, char*).
+        # Only meaningful right after a TYPE in a type-annotation position,
+        # so this never eats a real multiplication operator elsewhere.
+        nxt = self.peek()
+        if nxt and nxt[0] == "OP" and nxt[1] == "*":
+            self.advance()
+            name = f"{name}*"
+
+        return name
+
+    def match_ident_type(self):
+        """Like match_type(), but for a user-defined struct/class name (an
+        IDENT, not a TYPE token) in a type-annotation position — optionally
+        followed by a trailing '*'. syntax: DATA TYPES > STRUCT — a bare
+        struct name (`cfg: GLFWvidmode`) means pass/return the struct BY
+        VALUE; `GLFWvidmode*` explicitly means by pointer (the address-only
+        form every struct reference used before this existed). Only called
+        right after COLON/'->' in signature-parsing positions, same as
+        match_type(), so this never mistakes some other IDENT for a type."""
+        name = self.match("IDENT")
+        if name is None:
+            return None
+        nxt = self.peek()
+        if nxt and nxt[0] == "OP" and nxt[1] == "*":
+            self.advance()
+            name = f"{name}*"
+        return name
+
     def expect(self, kind, what=None):
         """Like match(), but a missing/mismatched token is a real compile
         error instead of being silently skipped. Use this at points in the
@@ -162,6 +231,7 @@ class Parser:
             elif t[0] == "XEON":   stmts.append(self.import_stmt(is_xeon_pkg=True))
             elif t[0] == "USE":    stmts.append(self.use_stmt())
             elif t[0] == "CLASS":  stmts.append(self.class_def())
+            elif t[0] == "STRUCT": stmts.append(self.struct_def())
             elif t[0] == "FN":     stmts.append(self.fn_def())
             else:                  stmts += self.stmt_list_item()
         return stmts
@@ -254,6 +324,30 @@ class Parser:
             alias = self.match("IDENT")
         return Use(name, alias=alias)
 
+    def struct_def(self):
+        # syntax: DATA TYPES > STRUCT — `struct Name { field: type ... }`.
+        # No `(...)`, no methods, no `let`/mut on fields — just a name and a
+        # LIB type per field, in order. Deliberately simpler than class_def:
+        # a struct is a raw C memory layout, not a Rubidium object.
+        self.match("STRUCT")
+        name = self.match("IDENT")
+        self.expect("LBRACE", f"'{{' to open struct '{name}'")
+        fields = []
+        while self.peek() and self.peek()[0] != "RBRACE":
+            fname = self.match("IDENT") or self.match("TYPE")
+            if fname is None:
+                raise SyntaxError(f"Line {self.line_no}: expected a field name inside struct '{name}', got {self.peek()}")
+            self.expect("COLON", f"':' after struct field '{fname}'")
+            ftype = self.match_type()
+            if ftype is None:
+                raise SyntaxError(
+                    f"Line {self.line_no}: expected a LIB type for struct field '{name}.{fname}' "
+                    f"(struct fields are raw C types — see DATA TYPES > LIB)"
+                )
+            fields.append((fname, ftype))
+        self.expect("RBRACE", f"'}}' to close struct '{name}'")
+        return StructDef(name, fields)
+
     def class_def(self):
         self.match("CLASS")
         name = self.match("IDENT")
@@ -319,7 +413,7 @@ class Parser:
                 if pname is None:
                     raise SyntaxError(f"Expected a parameter name at line {self.line_no}, got {self.peek()}")
                 self.match("COLON")
-                ptype = self.match("TYPE") or self.match("IDENT")
+                ptype = self.match_type() or self.match_ident_type()
                 if ptype: self._reject_void(ptype, "a callback parameter type")
                 params.append((pname, ptype))
                 if self.peek() and self.peek()[0] == "COMMA":
@@ -328,12 +422,48 @@ class Parser:
             ret_type = None
             if self.peek() and self.peek()[1] == "->":
                 self.match("OP")
-                ret_type = self.match("TYPE")
+                ret_type = self.match_type() or self.match_ident_type()
                 if ret_type: self._reject_void(ret_type, "a callback's return type")
             self.match("LBRACE")
             body = self.block()
             self.match("RBRACE")
             return FnDef(name, params, ret_type, body, is_callback=True)
+        # syntax: FFI — `fn ptr raw(params) -> ret as alias`. Binds against
+        # an already-resolved address (e.g. from glXGetProcAddress) sitting
+        # in a `ptr`-typed variable, instead of dlsym-ing a name off a
+        # loaded library handle. Detected by the literal TYPE token "ptr"
+        # right after `fn` — checked before the general FFIBind path below,
+        # which expects that position to be a library handle IDENT.
+        if self.peek() and self.peek()[0] == "TYPE" and self.peek()[1] == "ptr":
+            self.match("TYPE")
+            ptr_var_name = self.match("IDENT")
+            if ptr_var_name is None:
+                raise SyntaxError(
+                    f"Line {self.line_no}: expected a variable name after 'fn ptr' "
+                    f"(the ptr-typed variable holding the address to bind against)"
+                )
+            self.match("LPAREN")
+            params = []
+            while self.peek() and self.peek()[0] != "RPAREN":
+                pname = self.match("IDENT") or self.match("TYPE")
+                if pname is None:
+                    raise SyntaxError(f"Expected a parameter name at line {self.line_no}, got {self.peek()}")
+                self.match("COLON")
+                ptype = self.match_type() or self.match_ident_type()
+                if ptype: self._reject_void(ptype, "an FFI parameter type")
+                params.append((pname, ptype))
+                if self.peek() and self.peek()[0] == "COMMA":
+                    self.match("COMMA")
+            self.match("RPAREN")
+            ret_type = None
+            if self.peek() and self.peek()[1] == "->":
+                self.match("OP")
+                ret_type = self.match_type() or self.match_ident_type()
+            alias = None
+            if self.peek() and self.peek()[0] == "AS":
+                self.match("AS")
+                alias = self.match("IDENT")
+            return FFIBind(ptr_var_name, None, params, ret_type, alias=alias, is_ptr_bind=True)
         # BUGFIX/FEATURE (bugs.log #2): `fn (function_name) { ... }` — dynamic
         # function name substituted from a previously-declared SY symbol.
         # BUGFIX (bugs.log #9): record the holder name (before substitution)
@@ -385,7 +515,7 @@ class Parser:
                     # then misparse it as an entirely separate bogus parameter,
                     # corrupting the whole list and shifting every later
                     # parameter's positional binding.
-                    ptype = self.match("TYPE") or self.match("IDENT")
+                    ptype = self.match_type() or self.match_ident_type()
                     if ptype: self._reject_void(ptype, "an FFI parameter type")
                 params.append((pname, ptype))
                 if self.peek() and self.peek()[0] == "COMMA":
@@ -404,7 +534,7 @@ class Parser:
                     # function that returns nothing (e.g. most of OpenGL/GLFW's
                     # API: glClear, glBindBuffer, glfwPollEvents, ...). See
                     # emit_ffi_bind/the FnCall-emission call site in codegen.py.
-                    ret_type = self.match("TYPE")
+                    ret_type = self.match_type() or self.match_ident_type()
             alias = None
             if self.peek() and self.peek()[0] == "AS":
                 self.match("AS")
@@ -438,7 +568,7 @@ class Parser:
                 # BUGFIX (bugs.log #18): see the identical fix in the FFI
                 # binding branch above — class-typed parameters are
                 # tokenized as IDENT, not TYPE.
-                ptype = self.match("TYPE") or self.match("IDENT")
+                ptype = self.match_type() or self.match_ident_type()
                 if ptype: self._reject_void(ptype, "a function parameter type")
                 params.append((pname, ptype))
                 # DEFAULT PARAMETER VALUES: `fn test(x: i32 = 10)` — a bare
@@ -465,7 +595,7 @@ class Parser:
         ret_type = None
         if self.peek() and self.peek()[1] == "->":
             self.match("OP")
-            ret_type = self.match("TYPE")
+            ret_type = self.match_type() or self.match_ident_type()
             if ret_type: self._reject_void(ret_type, "a function's return type")
         self.match("LBRACE")
         body = self.block()
@@ -562,13 +692,13 @@ class Parser:
             vtype = None
             if self.peek() and self.peek()[0] == "COLON":
                 self.match("COLON")
-                vtype = self.match("TYPE")
+                vtype = self.match_type()
             elif self.peek() and self.peek()[0] == "TYPE":
-                vtype = self.match("TYPE")
+                vtype = self.match_type()
             if vtype: self._reject_void(vtype, "a variable type")
             if vtype in ("list", "index", "dict") and self.peek() and self.peek()[0] == "COLON":
                 self.match("COLON")
-                self.match("TYPE")
+                self.match_type()
             self.match("OP")
             value = self.expr()
             # BUGFIX (bugs.log #13): `let (x): index = []` — an empty `[]`
@@ -606,15 +736,20 @@ class Parser:
         vtype = None
         if self.peek() and self.peek()[0] == "COLON":
             self.match("COLON")
-            vtype = self.match("TYPE")
+            # match_type() alone only covers built-in/LIB type keywords — a
+            # user-defined class or struct name (`let mode: GLFWvidmode`)
+            # lexes as a plain IDENT, same as the identical gap already
+            # fixed for parameter types elsewhere (see fn_def's "class-typed
+            # parameter" note).
+            vtype = self.match_type() or self.match("IDENT")
         elif self.peek() and self.peek()[0] == "TYPE":
-            vtype = self.match("TYPE")
+            vtype = self.match_type()
         if vtype: self._reject_void(vtype, "a variable type")
         # Optional element-type annotation for collections: let x: list: i32 = [0,10,32]
         element_type = None
         if vtype in ("list", "index", "dict") and self.peek() and self.peek()[0] == "COLON":
             self.match("COLON")
-            element_type = self.match("TYPE")
+            element_type = self.match_type()
             if element_type: self._reject_void(element_type, "a collection element type")
         self.match("OP")
         value = self.expr()
@@ -968,7 +1103,7 @@ class Parser:
     def cast_expr(self):
         left = self.factor()
         while self.peek() and self.peek()[0] == "AS":
-            self.match("AS"); cast_t = self.match("TYPE")
+            self.match("AS"); cast_t = self.match_type()
             if cast_t: self._reject_void(cast_t, "a cast target type")
             left = TypeCast(left, cast_t)
         return left
@@ -1172,7 +1307,7 @@ class Parser:
             if (self.peek() and self.peek()[0] == "COLON"
                     and _nxt and _nxt[0] == "TYPE"):
                 self.match("COLON")
-                block_type = self.match("TYPE")
+                block_type = self.match_type()
                 if block_type: self._reject_void(block_type, "a math block's precision type")
                 e = MathBlock(e, block_type)
             # BUGFIX (bugs.log #10): postfix `.method()`/field chaining was
