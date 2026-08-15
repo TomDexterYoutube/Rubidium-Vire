@@ -1,70 +1,89 @@
 # =========================================
 # =========================================
-# Rubidium Programming Language Reference
-# File extension: .rub
-# Designed for beginners. Built to scale into real systems programming.
+# Rubidium VIRE Programming Language Reference
+# File extension: .vire
 # =========================================
 # =========================================
 
+
+# TABLE OF CONTENTS
+#
+# PART 1 — CORE LANGUAGE
+#   - Execution Model
+#   - Data Types
+#   - Variables
+#   - The Variable Overwrite Rule
+#   - Scope
+#
+# PART 2 — MEMORY MODEL
+#   - Memory Model
+#   - Global By Default
+#   - The Deep Copy Rule
+#   - Null Behavior
+#   - Memory — Dropping Variables
+#
+# PART 3 — TYPES & OPERATORS
+#   - Type Casting
+#   - Type Checking
+#   - Math
+#   - Comparison & Logic
+#
+# PART 4 — TEXT & COLLECTIONS
+#   - Strings
+#   - SY
+#   - str+
+#   - Collections
+#
+# PART 5 — INPUT / OUTPUT
+#   - Print & Input
+#   - Files
+#
+# PART 6 — CONTROL FLOW
+#   - Conditionals
+#   - Loops
+#   - Range Loop
+#   - Collection Iteration
+#   - Break & Continue
+#
+# PART 7 — FUNCTIONS & CLASSES
+#   - Functions
+#   - Imports
+#   - The Link Rule
+#   - Error Handling
+#   - Classes
+#
+# PART 8 — CONCURRENCY & STDLIB
+#   - Threading
+#   - Random
+#   - Time
+#   - OS
+#
+# PART 9 — NATIVE / C INTEROP
+#   - Conversion
+#   - FFI — Foreign Function Interface
+#
+# APPENDIX
+#   - Notes
 
 
 # =========================================
 # EXECUTION MODEL
 # =========================================
 
-# Rubidium runs in two phases:
+# VIRE is for FFI compatibility with Rubidium
 
-# PHASE 1 — TOP LEVEL
-#   Runs top to bottom before main().
-#   Creates variables in the global pool.
-#   Executes any function calls written at the top level immediately.
-#   Defines functions and classes but does NOT run them.
+# nothing top level runs the only time something runs is if the fn is called
 
-# PHASE 2 — MAIN
-#   After top level finishes, the compiler automatically runs fn main().
+# the only exception is FFI libs being loaded
 
-print("This runs first — top level")
-
-fn main() {
-    print("This runs second — main")
-}
-
-# =========================================
-# MEMORY MODEL
-# =========================================
-
-# All variables live in a SHARED GLOBAL POOL.
-#
-# Rules:
-# - Variables are visible everywhere once created.
-# - There is no automatic memory management.
-# - Memory must be freed manually using .drop().
-# - The only exceptions are open() file blocks and loop variables,
-#   which are freed automatically at the end of their block.
-#
-# Think of memory as a shared whiteboard —
-# everyone can see and modify it.
-
-# =========================================
-# LANGUAGE PHILOSOPHY
-# =========================================
-
-# Rubidium is designed around simplicity,
-# predictability, and explicit behavior.
-# Many modern languages use garbage collection,
-# ownership systems, reference counting,
-# borrow checking, or other hidden mechanisms.
-# Rubidium instead favors rules that are
-# visible and easy to reason about.
-
-# Rubidium favors behavior that is easy to
-# understand over behavior that is heavily optimized.
-# The language intentionally prioritizes
-# clarity and consistency over maximum performance.
 
 # =========================================
 # DATA TYPES
 # =========================================
+
+# -----------------------------------------
+# Rubidium
+# -----------------------------------------
 
 # Integers (signed):
 #   i32, i64, i128, i256, i512, i1024, i2048
@@ -95,51 +114,54 @@ let f: Any  = "I can be anything!"
 
 # Any can be used when you don't know the type in advance, for functions, return types and such
 
-# =========================================
-# GLOBAL BY DEFAULT
-# =========================================
+# -----------------------------------------
+# LIB
+# -----------------------------------------
 
-# Variables created normally are placed into the global memory pool.
+# C primitive types (alias mapping for interoperability / reference):
+# - integer types
+#   char        — 8-bit integer (signed or unsigned implementation-defined)
+#   signed char — explicitly signed 8-bit
+#   unsigned char — explicitly unsigned 8-bit
+#   short       — at least 16-bit signed
+#   unsigned short — at least 16-bit unsigned
+#   int         — at least 16-bit signed (commonly 32-bit)
+#   unsigned int — at least 16-bit unsigned
+#   long        — at least 32-bit signed (commonly 64-bit on LP64)
+#   unsigned long — at least 32-bit unsigned
+#   long long   — at least 64-bit signed
+#   unsigned long long — at least 64-bit unsigned
+#
+# - fixed-width integer types (from stdint.h)
+#   int8_t, uint8_t
+#   int16_t, uint16_t
+#   int32_t, uint32_t
+#   int64_t, uint64_t
+#   int128_t, uint128_t (where supported)
+#
+# - other integer types
+#   size_t      — unsigned type for sizes
+#   ptrdiff_t   — signed type for pointer differences
+#   intptr_t, uintptr_t — integer types guaranteed to hold a pointer
+#
+# - floating point types
+#   float       — typically 32-bit
+#   double      — typically 64-bit
+#   long double — extended precision (implementation-defined)
+#
+# - pointer and special types
+#   void*       — pointer to unknown type
+#   NULL        — null pointer constant
+#   _Bool / bool — boolean type (0 or 1)
+#
+# Notes:
+# - Use unsigned variants for non-negative values where overflow behavior matters.
+# - For fixed-width guarantees across platforms, prefer stdint.h types (int32_t, etc.).
+# - Interfacing with C libraries should follow the platform ABI and sizes.
 
-let score = 100
+# You can only do Vire code in Rubidium types — see CONVERSION below for
+# how to move values between Vire and lib types.
 
-# Global variables can be accessed anywhere.
-# Local variables must be declared explicitly.
-# Full syntax (mut is optional, only needed if reassigning later):
-#   let mut local name: type = value
-
-let local temp = 100
-
-# Local variables never enter the global pool
-# and are automatically dropped when their scope ends.
-
-# =========================================
-# THE DEEP COPY RULE
-# =========================================
-
-# Assigning one value to another creates a complete deep copy.
-
-let mut a = [1, 2, 3]
-let mut b = a
-
-# a and b are completely independent.
-# Rubidium does not use references,
-# borrowing, or shared ownership.
-
-# =========================================
-# NULL BEHAVIOR
-# =========================================
-
-# Null is a valid value for every type.
-
-let value: i32 = Null
-
-# Null is considered smaller than every non-null value.
-# Conceptually, Null behaves like negative infinity.
-
-Null < 0         # True
-Null < -999999   # True
-Null == Null     # True
 
 # =========================================
 # VARIABLES
@@ -161,6 +183,7 @@ counter = 5
 let a = 10
 a = 20   # ERROR: a is not mutable
 
+
 # =========================================
 # THE VARIABLE OVERWRITE RULE
 # =========================================
@@ -177,8 +200,9 @@ x = 15
 
 let x = "Hi"
 
-# And a variable with that name already exits then it drops it
+# And if a variable with that name already exists, then it drops it
 # Then recreates it as a new variable
+
 
 # =========================================
 # SCOPE
@@ -191,11 +215,99 @@ while True {
     break
 }
 
-# When the loop ends the local is dropped that is True for
-# For loops
-# Functions
-# While loop
-# And if loops
+# When the block ends, the local is dropped. This holds true for:
+#   - for loops
+#   - functions
+#   - while loops
+#   - if blocks
+
+
+# =========================================
+# MEMORY MODEL
+# =========================================
+
+# All variables live in a SHARED GLOBAL POOL.
+#
+# Rules:
+# - Variables are visible everywhere once created.
+# - There is no automatic memory management.
+# - Memory must be freed manually using .drop().
+# - The only exceptions are open() file blocks and loop variables,
+#   which are freed automatically at the end of their block.
+#
+# Think of memory as a shared whiteboard —
+# everyone can see and modify it.
+
+
+# =========================================
+# GLOBAL BY DEFAULT
+# =========================================
+
+# Variables created normally are placed into the global memory pool.
+
+let score = 100
+
+# Global variables can be accessed anywhere.
+# Local variables must be declared explicitly.
+# Full syntax (mut is optional, only needed if reassigning later):
+#   let mut local name: type = value
+
+let local temp = 100
+
+# Local variables never enter the global pool
+# and are automatically dropped when their scope ends.
+
+
+# =========================================
+# THE DEEP COPY RULE
+# =========================================
+
+# Assigning one value to another creates a complete deep copy.
+
+let mut a = [1, 2, 3]
+let mut b = a
+
+# a and b are completely independent.
+# Rubidium does not use references, borrowing, or shared ownership
+# BY DEFAULT — the only exception is the explicit 'link' keyword,
+# which opts a specific variable into sharing (see THE LINK RULE).
+
+
+# =========================================
+# NULL BEHAVIOR
+# =========================================
+
+# Null is a valid value for every type.
+
+let value: i32 = Null
+
+# Null is considered smaller than every non-null value.
+# Conceptually, Null behaves like negative infinity.
+
+Null < 0         # True
+Null < -999999   # True
+Null == Null     # True
+
+
+# =========================================
+# MEMORY — DROPPING VARIABLES
+# =========================================
+
+# .drop() frees a variable's memory immediately.
+# The variable no longer exists after being dropped.
+# Collections recursively free all nested data.
+
+let val = 42
+val.drop()
+
+let mut items: list = [1, 2, 3]
+items.drop()
+
+# You can remove a specific variable in a collection
+# It removes it and shifts the structure it DOES NOT replace it with Null
+
+items(1).drop()
+
 
 # =========================================
 # TYPE CASTING
@@ -207,6 +319,7 @@ let y: i32 = 5
 let large: i64 = y as i64
 let f: f64 = 100 as f64
 
+
 # =========================================
 # TYPE CHECKING
 # =========================================
@@ -217,6 +330,7 @@ let f: f64 = 100 as f64
 # Example (will NOT compile):
 # let val: i32 = 5
 # val = "hello"   # ERROR: wrong type
+
 
 # =========================================
 # MATH
@@ -284,6 +398,7 @@ let e = (1 + 2 * 3): f64     # 7.0
 
 let n = ((10 / 3): f64 + 1): f2048   # 4.3333...
 
+
 # =========================================
 # COMPARISON & LOGIC
 # =========================================
@@ -304,6 +419,7 @@ let check: bool = 10 > 5   # True
 #   not
 
 let result: bool = True and not False   # True
+
 
 # =========================================
 # STRINGS
@@ -443,6 +559,7 @@ print(text.len())
 # Output:
 # 5
 
+
 # =========================================
 # SY
 # =========================================
@@ -460,6 +577,7 @@ fn (function_name)() {
 
 # You put () around the SY when its used and ' when its made
 
+
 # =========================================
 # STR+
 # =========================================
@@ -470,6 +588,7 @@ let my_str_plus: str+ = """
 Hello
 I'm a big string!
 """
+
 
 # =========================================
 # COLLECTIONS
@@ -618,6 +737,7 @@ my_dictplus().add(2)
 # strings need quotes ("test"), numbers and other
 # types do not.
 
+
 # =========================================
 # PRINT & INPUT
 # =========================================
@@ -667,6 +787,7 @@ print("this line never runs")
 # exit() with no arguments exits with status 0:
 
 exit()
+
 
 # =========================================
 # FILES
@@ -725,24 +846,6 @@ try {
 # missing.txt is created either way — the try/error block
 # just lets you catch and handle the "file did not exist" error.
 
-# =========================================
-# MEMORY — DROPPING VARIABLES
-# =========================================
-
-# .drop() frees a variable's memory immediately.
-# The variable no longer exists after being dropped.
-# Collections recursively free all nested data.
-
-let val = 42
-val.drop()
-
-let mut items: list = [1, 2, 3]
-items.drop()
-
-# You can remove a specific variable in a collection
-# It removes it and shifts the structure it DOES NOT replace it with Null
-
-items(1).drop()
 
 # =========================================
 # CONDITIONALS
@@ -760,6 +863,7 @@ if x == 7 {
 
 # The else must be on the } end of the if or other else
 
+
 # =========================================
 # LOOPS
 # =========================================
@@ -772,6 +876,7 @@ while count < 5 {
     print(count)
     count = count + 1
 }
+
 
 # =========================================
 # RANGE LOOP
@@ -803,6 +908,7 @@ for banana in range(1, 10) {
 }
 
 # Loop indexing starts at 0
+
 
 # =========================================
 # COLLECTION ITERATION
@@ -871,6 +977,7 @@ open("data.txt") as file {
     }
 }
 
+
 # =========================================
 # BREAK & CONTINUE
 # =========================================
@@ -888,6 +995,7 @@ for i in range(1, 10) {
     if i == 5 {continue}
     print(i)
 }
+
 
 # =========================================
 # FUNCTIONS
@@ -979,8 +1087,56 @@ add(7, b = 3)      # OK — 7 positional for 'a', 3 named for 'b'
 # (see CLASSES below) — declared on the method's own parameter list, bound
 # the same way at the call site (p.method(x = 1)).
 
+
 # =========================================
-# The Link Rule
+# IMPORTS
+# =========================================
+
+# import loads another .vire file and exposes it through a namespace
+# named after the file.
+
+import helper
+
+helper.some_fn()
+print(helper.shared_num)
+
+# Give the namespace a different name with 'as':
+
+import math_tools as mt
+
+mt.sin(1.0)
+
+# -----------------------------------------
+# SHARED VS LOCAL IMPORTS
+# -----------------------------------------
+
+# By default, import shares ONE instance of the imported file's state
+# across every file that imports it. If file A and file B both plain
+# `import helper`, they are looking at the same helper.shared_num —
+# a change either one makes is visible to the other.
+
+import helper
+
+helper.shared_num = 42   # visible to every other file that imported helper normally
+
+# 'import local' instead gives THIS file its own private instance of the
+# imported file's state. Changes made through it are invisible to every
+# other importer — including other 'import local' importers, who each get
+# their own separate instance too.
+
+import local helper
+
+helper.shared_num = 42   # only visible inside this file
+
+# This choice also determines what 'link' sees when linking through the
+# namespace (see LINK ACROSS FILES below): link follows whichever instance
+# the namespace refers to, so linking through a plain import reaches the
+# shared instance, and linking through an 'import local' reaches that
+# file's private one.
+
+
+# =========================================
+# THE LINK RULE
 # =========================================
 
 # Say you have a variable that is a local val and it is large
@@ -1046,6 +1202,7 @@ helper.append_to(link my_list)
 let mut editable = link helper.shared_list
 editable().add(9)
 
+
 # =========================================
 # ERROR HANDLING
 # =========================================
@@ -1078,6 +1235,7 @@ try {
 } error {
     print("Error: " + error)   # Error: n must not be negative
 }
+
 
 # =========================================
 # CLASSES
@@ -1182,6 +1340,7 @@ print(b.health) # 10
 
 # Classes can not access global memory unless link is used or passed through
 
+
 # =========================================
 # THREADING
 # =========================================
@@ -1249,9 +1408,7 @@ thread.kill(1)
 
 # Threads share the global memory pool.
 
-# Any global variable can be read or modified
-
-# by any thread.
+# Any global variable can be read or modified by any thread.
 
 let counter = 0
 
@@ -1261,11 +1418,8 @@ let counter = 0
 # THREAD-LOCAL DATA
 # -----------------------------------------
 
-# Function parameters and local variables
-
-# belong only to the thread currently
-
-# executing them.
+# Function parameters and local variables belong only to the
+# thread currently executing them.
 
 fn worker(id) {
     let local temp = 10
@@ -1275,18 +1429,11 @@ fn worker(id) {
 }
 
 # Every thread receives its own copy of:
-
+#   - Function parameters
+#   - Local variables
+#   - Loop variables
 #
-
-# - Function parameters
-
-# - Local variables
-
-# - Loop variables
-
-# These values are never shared between
-
-# threads.
+# These values are never shared between threads.
 
 # -----------------------------------------
 # SHARED DATA
@@ -1300,15 +1447,9 @@ fn add() {
     total = total + 1
 }
 
-# If multiple threads modify the same global
-
-# variable at the same time, the result is
-
-# undefined.
-
-# Rubidium provides no automatic race
-
-# condition protection.
+# If multiple threads modify the same global variable at the same
+# time, the result is undefined. Rubidium provides no automatic
+# race condition protection.
 
 # -----------------------------------------
 # AUTOMATIC CLEANUP
@@ -1325,19 +1466,15 @@ fn add() {
 # -----------------------------------------
 
 # Variable Type       Shared?
-
 # Global Variable     Yes
-
 # Function Parameter  No
-
 # Local Variable      No
-
 # Loop Variable       No
-
 # File Handle         No
 
 # Simple rule: If it is in the global pool, it is shared.
 # Otherwise it belongs only to the currently executing thread.
+
 
 # =========================================
 # RANDOM
@@ -1359,7 +1496,7 @@ random.shuffle(items)
 # Pick a random value from a collection:
 
 random.choice(items)
-random.choice_index(items) # returns the index of the iteam isntead of th value
+random.choice_index(items) # returns the index of the item instead of the value
 
 let mut my_index: index = ["a": 1, "b": 2]
 random.choice(my_index)
@@ -1373,6 +1510,7 @@ random.choice_index(my_dict("scores")) # can not return keys, with dict+ this ru
 random.seed("seed")
 
 # to set the starting seed
+
 
 # =========================================
 # TIME
@@ -1403,10 +1541,11 @@ time.timer_pause(1)
 
 time.timer_stop(1)
 
-# Read elapsed time in seconds.fractional seconds.
+# Read elapsed time, in fractional seconds.
 # Returns the float type specified when the timer was started.
 
 let elapsed = time.timer_read(1)
+
 
 # =========================================
 # OS
@@ -1453,30 +1592,49 @@ let listing = os.run({cmd: "ls", args: ["-l", "/tmp"]})
 
 os(1).drop()
 
+
+# =========================================
+# CONVERSION
+# =========================================
+
+# Simple conversion syntax between Rubidium (Vire) types and C/lib types.
+# The direction decides which function to use:
+#   cast.<target_type>(value)    — Rubidium type    -> C/lib type
+#   retrive.<target_type>(value) — C/lib type        -> Rubidium type
+# Examples:
+
+# Convert Rubidium integer to C int (lib alias):
+let a: i32 = 42
+let b: c_type = cast.int(a)
+
+# Convert C pointer (void*) back to Rubidium Any (opaque) — the reverse
+# direction, so retrive is used instead of cast:
+let ptr: void* = Null
+let any_val: Any = retrive.Any(ptr)
+
+# Convert between numeric sizes explicitly:
+let x: i64 = 10000000000
+let y: i32 = cast.i32(x)   # narrows, may truncate
+
+# Convert Rubidium str to C char* (for FFI):
+let s: str = "hello"
+let cstr: c_type = cast.char*(s)
+
+# Notes:
+# - cast.target(value) converts a Rubidium value INTO a C/lib type.
+# - retrive.target(value) converts a C/lib value BACK INTO a Rubidium type.
+# - Conversions that may lose precision must be explicit.
+# - Null can be cast to any pointer type.
+
+
 # =========================================
 # FFI — FOREIGN FUNCTION INTERFACE
 # =========================================
 
-# FFI loads another RUBIDIUM-COMPILED shared library — not an arbitrary C/
-# C++/Rust .so. Build one with `-s` (no main entry, every top-level fn
-# exported): `rubidium -s mylib.rub mylib.so`. Both sides of the call are
-# the same compiler's own output, so they share the exact same value
-# layout — any real Rubidium type (i32, str, list, dict+, a class instance,
-# Any, ...) just crosses the boundary directly, the same way it would in an
-# ordinary same-file function call. No conversion step, no restricted type
-# subset.
-
-use FFI
-
 let lib = FFI("lib.so")
 
-# Bind an exported function. Parameter/return types are normal Rubidium
-# types — including collections, which a real foreign-C FFI could never
-# accept directly.
 
 fn lib lib_fn(var: i32, var2: dict+) as fnut
-
-# Call using the Rubidium name.
 
 fnut(1, my_dictplus)
 
@@ -1514,7 +1672,7 @@ fn sqrt(value: f64) -> f64 {
 # IMPORTING FFI WRAPPERS
 # -----------------------------------------
 
-# math_tools.rub
+# math_tools.vire
 
 let native = FFI("libs/math.so")
 
@@ -1522,361 +1680,13 @@ fn native native_sin(x: f64) -> f64 as sin
 
 fn native_sqrt(x: f64) -> f64 as sqrt
 
-# another_file.rub
+# another_file.vire
 
 import math_tools as mt
 
 mt.sin(1.0)
 mt.sqrt(25.0)
 
-# -----------------------------------------
-# FFI CALLBACKS
-# -----------------------------------------
-
-# Everything the FFI section above does is Rubidium being the one in
-# charge — you call a C function, it runs, it hands an answer back, done.
-# A callback flips that around: you're telling a C library "here's a piece
-# of code — don't run it now, hang onto it, and call it YOURSELF later,
-# whenever something happens." GLFW doesn't know when you're going to press
-# a key. So instead, you hand GLFW the address of a function ahead of
-# time, and GLFW calls it the instant a key is pressed — possibly seconds
-# or minutes from now, from code you don't control the timing of at all.
-
-# Why this needs its own keyword instead of just "get the address": a
-# normal Rubidium function is compiled expecting to be called BY OTHER
-# RUBIDIUM CODE, which quietly sets a few things up every time a function
-# is called — memory bookkeeping, and a way to report errors back up the
-# chain. Think of it like an employee who needs their desk, badge, and
-# tools ready before their shift starts — Rubidium sets all of that up
-# automatically every time you call a function, without you ever seeing it
-# happen. If C just called your function's raw address directly, none of
-# that setup would happen. `fn callback` exists so you never have to think
-# about this — it quietly builds a small "receptionist" in front of your
-# function that does Rubidium's setup first, then calls your real code,
-# every single time C calls in.
-
-# `fn callback` is just like a normal `fn`, with a body and everything —
-# the ONLY difference is the word `callback` right after `fn`. That one
-# word tells the compiler "a C library is going to call this directly, at
-# some unpredictable point in the future — build the receptionist for it."
-# Because of this, `callback` is a reserved word — it can't be used as a
-# variable or parameter name anywhere, the same as `local`/`open`/`file`.
-
-# The parameter types here are NOT your choice — they have to match
-# EXACTLY what the C library's own documentation says it will pass to your
-# function. C decides the shape; Rubidium just needs to be told what it
-# is, the same way you already tell it the shape of a C function you're
-# calling INTO (fn ffi_lib my_c_function(msg: str) -> i32 as my_function).
-
-fn callback my_key_handler(window: Any, key: i32, scancode: i32, action: i32, mods: i32) -> Any {
-    print(i"key pressed: {key}")
-}
-
-# Handing GLFW the callback: write the function's NAME, with no
-# parentheses and no arguments. Parentheses would CALL it right now,
-# today, once — which isn't what you want. Leaving them off means "here's
-# the function itself, hang onto it and call it yourself later." This is
-# the one new piece of syntax here: everywhere else in Rubidium, a bare
-# function name with no call is an error — but for a name declared with
-# `fn callback`, it's how you hand it off.
-
-glfw.set_key_callback(win, my_key_handler)
-
-# From this point on, you don't call my_key_handler yourself at all — GLFW
-# does, on its own schedule, every time a key event happens, for as long
-# as your program keeps polling for events (glfwPollEvents()). Nothing
-# else about writing the function's BODY is different from any other
-# Rubidium function — print(), global variables, everything works
-# normally inside it, specifically because the generated receptionist
-# already did the setup before your code runs.
-
-# Rules:
-# - Use `fn callback` instead of plain `fn` ONLY for a function you're
-#   going to hand to a C library as an event handler. Every other function
-#   stays exactly as `fn` as always.
-# - The parameter types and return type must match what the C library
-#   will actually call your function with — the compiler cannot check this
-#   for you, the same way it can't check a regular FFI binding's signature.
-# - Write the function name with NO parentheses when handing it to a C
-#   library expecting a callback. With parentheses, it's an ordinary
-#   function call, right now, once.
-# - Not yet supported: calling/passing a `fn callback` in debug mode
-#   (`xeon run --debug` / the debugger) — compile and run the real binary
-#   to test callback behavior.
-
-# =========================================
-# KEYBOARD
-# =========================================
-
-# the keyboard module is a cleaner, instant version of input() — a key is
-# read the moment it's pressed, no Enter needed.
-
-# `use X as Y` works on any module (not just imports) — Y is just a local
-# rename, X is still the real module.
-
-use keyboard as key
-
-# key.wait() blocks until a key is pressed, then returns it as a str.
-
-print(key.wait())
-
-# As soon as a key is pressed it stops and returns it.
-
-# Letters always come back lowercase, e.g. "a" — never "A". Shift+letter
-# and Ctrl+letter are reported as "shift+a" / "ctrl+a" (the letter tells you
-# which key, the prefix tells you which modifier was held). Other keys come
-# back as their own name: "space", "enter", "tab", "backspace", "esc",
-# "up", "down", "left", "right". Anything else prints as the character
-# itself (e.g. "!", "9").
-#
-# A bare Shift/Ctrl/Alt/CapsLock press with nothing else can't be reported
-# at all — no terminal program can see that, only its effect on a key
-# pressed alongside it. This module only ever tells you about a real key.
-
-# key.thread(rate) polls the keyboard in the background — pair it with
-# thread(...) so it doesn't block your main loop, and read key.last() from
-# there to pick up what it's seen.
-
-thread(key.thread(100), 1)
-
-# this must be used with the thread module — checks for a key press this
-# many times a second (default 100, can be changed).
-
-let mut pressed: str = key.last()
-
-# key.last() is non-blocking and consuming: it returns the most recent key
-# key.thread() has seen, or "" if nothing new has come in since the last
-# call — so polling it in a loop never sees the same keypress twice.
-
-# =========================================
-# NET
-# =========================================
-
-# net connects Rubidium programs to each other on a LAN — not a general
-# sockets API. Two programs speak the same built-in protocol automatically;
-# you never touch ports, addresses, or handshakes yourself.
-
-use net
-
-# net.process(rate, name) must be running (via thread) before find() /
-# requests() / accept() do anything — it's what makes YOUR program
-# discoverable to other Rubidium programs' net.find() calls, and handles
-# the protocol plumbing in the background. Runs forever, like a while loop.
-#
-#   rate — how many visibility pings per second it broadcasts so already-
-#          running programs are ambiently discoverable. Optional, defaults
-#          to 2. While it's alive it also listens for and answers incoming
-#          net.find() requests and connection requests the whole time.
-#   name — an optional display name (defaults to "" — no name set). A
-#          named peer shows up AS that name in find()/list()/requests()
-#          instead of a bare number (see DISCOVERY below).
-
-thread(net.process(2), 0)                    # no name — shows up as a number
-thread(net.process(2, "Max's Game"), 0)      # named
-
-# -----------------------------------------
-# DISCOVERY
-# -----------------------------------------
-
-# find() actively sends out a discovery request and collects replies from
-# every net.process() currently running on the LAN. Returns a list ordered
-# by ping, fastest first — each entry is that peer's NAME if they set one,
-# or their id (a plain number) if they didn't.
-
-let found: list = net.find()
-# e.g. ["Max's Game", 7, "Bob's Server"]
-
-# Currently-connected peers (already accepted/connected, not just found) —
-# same convention: name if set, id otherwise.
-
-let connected: list = net.list()
-
-# -----------------------------------------
-# CONNECTING
-# -----------------------------------------
-
-# connect/accept/listen/data/send/close all take whatever value came out
-# of find()/list()/requests() — a name OR a plain id, either works:
-
-net.connect("Max's Game")   # or: net.connect(7)
-
-# Two peers CAN pick the same name — there's no uniqueness check. Connecting
-# by a duplicate name always resolves to whichever match is FIRST in ping
-# order (the closest/fastest one) — the same ordering find()/list() already
-# use, so it's a deterministic tiebreak, not a random pick.
-
-let pending: list = net.requests()   # ids/names currently asking to connect
-net.accept("Max's Game")
-
-# -----------------------------------------
-# RECEIVING
-# -----------------------------------------
-
-thread(net.listen("Max's Game"), 5)   # runs forever, receiving for that connection
-
-# Poll from your own loop. Consuming read: once read, it's cleared for
-# that connection — the next net.data(...) call returns Null until a NEW
-# message arrives, so you never process the same message twice.
-
-let msg = net.data("Max's Game")
-
-# -----------------------------------------
-# SENDING
-# -----------------------------------------
-
-# Send any Rubidium value. It goes out as a string with a small type-tag
-# header, and the receiving side's net.data() converts it back to the
-# right type automatically — you get back an i32, a str, a list, etc., not
-# raw text.
-#
-# Wire format: "TAG:value", tag is one of i/f/s/b/n/l —
-#   i:42            -> i32/i64  42
-#   f:3.14          -> float    3.14
-#   s:hello         -> str      "hello"
-#   b:True          -> bool     True
-#   n:              -> Null
-#   l:i:7,s:K,i:2   -> list     [7, "K", 2]  (elements recursively tagged)
-#
-# v1 covers scalars and FLAT lists of scalars only — nested list/index/
-# dict/dict+ aren't supported over the wire yet.
-
-net.send("Max's Game", "hit:0")
-net.send("Max's Game", 42)
-net.send("Max's Game", [7, "K", 2])
-
-# -----------------------------------------
-# CLOSING
-# -----------------------------------------
-
-net.close("Max's Game")
-
-# =========================================
-# MODULES & IMPORTS
-# =========================================
-
-# Imported files are isolated through namespaces.
-# 'use' enables built-in compiler-provided modules.
-# A module that is not declared with 'use' cannot be accessed.
-
-use thread
-use random
-use time
-use os
-use FFI
-
-# 'import' loads an external .rub file from the same folder into your code with the name of the file as the namespace
-
-import math_tools
-
-math_tools.sin(0.5)
-
-# =========================================
-# IMPORT ALIASES
-# =========================================
-
-# Imports can be renamed using 'as'.
-# This creates a shorter namespace alias.
-
-import math_tools as mt
-
-mt.sin(0.5)
-
-# The original namespace still exists.
-
-math_tools.sin(0.5)
-
-# Alias names only affect access.
-# They do not copy or duplicate the module.
-
-# =========================================
-# SHARED VS LOCAL IMPORTS
-# =========================================
-
-# A plain 'import' creates ONE shared instance of that module for the whole
-# program. The module's file is loaded once, and every file that imports it
-# sees the same variables — exactly like a normal global.
-
-# main.rub
-import file_one
-import file_two
-
-# file_two.rub
-import file_one
-
-# Here file_one exists once. If main.rub changes file_one's state, file_two
-# sees that change, and the other way round — they are the same variable.
-
-file_one.bump()          # main.rub
-print(file_one.count)    # 1
-print(file_two.read())   # 1  — file_two reads the same file_one
-
-# 'import local' gives the importing file its OWN private instance instead.
-# The module is loaded again under that file alone, with its own independent
-# copy of every variable. This mirrors 'let' vs 'let local': shared by
-# default, 'local' when you want your own.
-
-# file_two.rub
-import local file_one
-
-# Now file_two has a file_one that is completely separate from main's.
-
-file_one.bump()          # main.rub — affects main's instance only
-print(file_one.count)    # 1
-print(file_two.read())   # 0  — file_two's own instance is untouched
-
-# Rules:
-# - 'import x'        — one instance shared by every file that imports it
-# - 'import local x'  — a private instance belonging to this file only
-# - Two different files that each use 'import local x' get two separate
-#   instances, and neither affects the shared one.
-# - A local instance runs the module's top level for itself, so it starts
-#   from the module's initial values.
-# - Aliases work the same way: 'import local file_one as fo'
-
-import local math_tools as mt
-
-# =========================================
-# MAIN ENTRY POINT
-# =========================================
-
-# The compiler always looks for fn main() as the program entry point.
-# It runs after all top-level code has finished.
-
-fn main() {
-    print("Welcome to Rubidium!")
-}
-
-
-
-# =========================================
-# XEON
-# =========================================
-
-# Xeon is the Rubidium manager and can do extra stuff
-
-# -----------------------------------------
-# XEON PACKAGES
-# -----------------------------------------
-
-# If you install Rubidium from the official manager (Xeon)
-# Then you can use packages
-
-xeon math_tools
-
-print(math_tools.pi)
-
-# From the caller's side, a package is used just like an import —
-# same namespace-based access. The difference is where the code
-# comes from: import loads a local .rub file, while Xeon downloads
-# and manages the package for you.
-# If you want to learn more use the command Xeon pkg help
-
-# -----------------------------------------
-# XEON LIB COMPILE
-# -----------------------------------------
-
-# With Xeon you can compile Rubidium code without a entry and use as a lib
-# The only different rules are that there is no top level and no main()
 
 # =========================================
 # NOTES
@@ -1916,9 +1726,11 @@ print(math_tools.pi)
 
 # Assignment:
 #   - Assignment copies values
-#   - Assignment never creates references
+#   - Assignment never creates references, by default
 #   - Assignment never transfers ownership
 #   - Assignment always creates an independent value
+#   - The only exception is 'link', which explicitly opts a variable
+#     into sharing instead of copying (see THE LINK RULE)
 
 # Scope:
 #   - Variables created at the top level are visible everywhere
@@ -2080,8 +1892,12 @@ print(math_tools.pi)
 
 # Imports:
 #   - use enables built-in modules
-#   - import loads external .rub files
+#   - import loads external .vire files
 #   - Imported files are accessed through their namespace
+#   - import can be renamed with 'as' (import x as y)
+#   - A plain import shares ONE instance of that file's state across
+#     every importer; 'import local' gives just this file its own
+#     private instance (see IMPORTS / SHARED VS LOCAL IMPORTS)
 #   - Built-in modules and imported namespaces are separate systems
 #   - Missing imports or symbols result in compile errors
 
@@ -2137,3 +1953,4 @@ print(math_tools.pi)
 #     the program always keeps running with the clamped value.
 #   - Overflow errors are reported once per operation.
 #   - The clamped result is stored before execution continues.
+
