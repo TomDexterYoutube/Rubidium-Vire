@@ -221,8 +221,33 @@ Box* box_copy(Box* src) {
     return src;
 }
 
-long long unbox_i(Box* b) { return b ? b->i : 0; }
-double unbox_f(Box* b) { return b ? b->f : 0.0; }
+// BUGFIX (bugs.log #2/#4): both of these used to blindly read a single
+// fixed field (->i or ->f) regardless of the Box's ACTUAL type tag. A Box
+// only ever populates ONE of ->i/->f when it's created (box_i sets ->i and
+// leaves ->f untouched — whatever that memory happened to hold before,
+// often a stale value from an entirely different, already-freed Box the
+// allocator handed back the same address for); reading the OTHER field
+// back out is reading garbage, not a real value. This silently surfaced
+// as: an int-valued element (e.g. `255` in a list also containing floats
+// like `0.5`) being read through unbox_f() — the path every coercion to a
+// float-typed variable/parameter goes through — always came back as some
+// unrelated stale float (confirmed: often 0.0, but in general whatever the
+// arena's last real float write happened to be), while the equivalent
+// direct/dynamic access (print() on the Box itself, which switches on
+// ->type) read the same element correctly. Converting between the tagged
+// type and the requested representation (same numeric conversion coerce()
+// already does at the IR level for a STATICALLY-typed int/float pair) is
+// exactly what's needed here at the DYNAMIC (Box) level too.
+long long unbox_i(Box* b) {
+    if(!b) return 0;
+    if(b->type==1) return (long long)b->f;
+    return b->i;
+}
+double unbox_f(Box* b) {
+    if(!b) return 0.0;
+    if(b->type==0) return (double)b->i;
+    return b->f;
+}
 char* unbox_s(Box* b) { return (b && b->type==2) ? b->s : ""; }
 // bugs.log OPEN-9: accept type==5 (boxed class instance) too, not just the
 // generic type==3 pointer/collection tag — every EXISTING static-type
