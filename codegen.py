@@ -2370,7 +2370,31 @@ class CodeGen:
                 self._gather_vardecl_types(node.try_body, type_map)
                 self._gather_vardecl_types(node.error_body, type_map)
             elif isinstance(node, FnDef):
-                self._gather_vardecl_types(node.body, type_map)
+                # BUGFIX (bugs.log #1): this pre-scan runs BEFORE emit_fn ever
+                # executes for ANY function, so a call like `mesh(key)` inside
+                # a function body — where `mesh` is that function's OWN
+                # PARAMETER, not a global — hit _infer_type's FnCall branch
+                # with `self.local_vars_stack` completely empty. Neither the
+                # "is it a %Box* local" nor "is it a %Box* global" check could
+                # possibly succeed, so it fell all the way through to the
+                # generic "i64" default — even though the parameter's real
+                # type (e.g. `dict`) is a %Box*. That silently gave a global
+                # like `let val = mesh(key)` (no explicit type — the exact
+                # trigger for this prescan at all) a fixed i64 slot instead of
+                # %Box*, so the actual store later (a real %Box* result)
+                # went through unbox_i and got truncated/misread — while the
+                # SAME expression used directly (`print(mesh(key))`, needing
+                # no global slot / no prescan) read correctly. Push this
+                # function's own parameter types as a real scope before
+                # recursing, exactly like emit_fn itself does when it later
+                # runs for real, so a parameter-typed collection is
+                # recognized here too.
+                param_scope = {pn: self._ffi_type_to_ir(pt) for pn, pt in node.params}
+                self.local_vars_stack.append(param_scope)
+                try:
+                    self._gather_vardecl_types(node.body, type_map)
+                finally:
+                    self.local_vars_stack.pop()
             elif isinstance(node, FileOpen):
                 if node.var_name:
                     self._file_handle_vars[node.var_name] = -1  # sentinel during gather pass
@@ -2498,8 +2522,19 @@ class CodeGen:
             for s in node.try_body: self._collect_global(s)
             for s in node.error_body: self._collect_global(s)
         elif isinstance(node, FnDef):
+            # BUGFIX (bugs.log #1): same issue as _gather_vardecl_types'
+            # identical FnDef branch (see its comment) — THIS is the pass
+            # that actually calls declare_global via the `else` branch
+            # above (line ~2476's `self._infer_type(node.value)`), so it
+            # needs the same parameter-scope push, independently of the
+            # type_map prescan pass already having the right answer.
             # Variable pool: let declarations inside regular functions go to the global pool
-            for s in node.body: self._collect_global(s)
+            param_scope = {pn: self._ffi_type_to_ir(pt) for pn, pt in node.params}
+            self.local_vars_stack.append(param_scope)
+            try:
+                for s in node.body: self._collect_global(s)
+            finally:
+                self.local_vars_stack.pop()
         elif isinstance(node, FileOpen):
             if node.var_name:
                 self._file_handle_vars[node.var_name] = -1  # sentinel during collect pass
